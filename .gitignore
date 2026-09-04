@@ -1,0 +1,54 @@
+# macOS metadata
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Android APK/ZIP originales y extracción -- nunca commitear el juego (DMCA)
+*.apk
+*.zip
+/sacredodyssey_extract/
+
+# Java decompilado con jadx (derivado, regenerable)
+/decompiled/
+/GloftSOHP/
+
+# Librerías .so propietarias del juego original
+lib/*.so
+lib/**/*.so
+sacredodyssey_extract/lib/
+
+# Assets del juego montados para pruebas
+ux0_data/
+assets/
+
+# Build artifacts
+/build/
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+*.elf
+*.self
+*.vpk
+*.suprx
+*.bin
+
+# Debugging en consola real
+/logs/
+log_*.txt
+*.psp2dmp
+
+# Python
+__pycache__/
+*.pyc
+
+# Config local del toolkit (contiene IP de tu Vita -- no es secreto pero es de tu red)
+.psvita-toolkit.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+cmake-build-*/
+compile_commands.json
