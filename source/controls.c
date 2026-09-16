@@ -68,6 +68,15 @@ enum HudWidgetOffset {
 
 static bool is_widget_active(uintptr_t widget, float *out_x, float *out_y) {
     if (!widget) return false;
+    // Guard against dangling/garbage HudWidget* left in the Hud widget table
+    // (confirmed crash: pressing Cross while HUD_OFFSET_TUTORIAL_DLG held a
+    // stale non-null value -- e.g. 0x4620656e, not 4-byte aligned -- caused a
+    // data abort dereferencing widget+0x18 in is_widget_active). A real
+    // HudWidget* is always at least 4-byte aligned (it has a vtable), so a
+    // misaligned value can never be a live object; treat it as "not active"
+    // instead of crashing, same as the existing NULL fallback the callers in
+    // controls_update() already handle.
+    if (widget & 0x3) return false;
     // widget + 0x18 is the visible/active flag in HudWidget
     uint8_t visible = *(uint8_t *)(widget + 0x18);
     if (!visible) return false;
@@ -79,7 +88,7 @@ static bool is_widget_active(uintptr_t widget, float *out_x, float *out_y) {
 static bool get_widget_pos(enum HudWidgetOffset offset, float *out_x, float *out_y) {
     if (!s_hud_s_pInstance_ptr || !*s_hud_s_pInstance_ptr) return false;
     uintptr_t hud = **s_hud_s_pInstance_ptr;
-    if (!hud) return false;
+    if (!hud || (hud & 0x3)) return false;
     uintptr_t widget = *(uintptr_t *)(hud + offset);
     return is_widget_active(widget, out_x, out_y);
 }

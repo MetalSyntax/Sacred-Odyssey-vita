@@ -2983,3 +2983,71 @@ textura en el personaje + montura completamente negra.
   - Build limpio ejecutado con `psvita-toolkit build --preset debug`.
   - Generados `build/eboot.bin` y `build/sacredodyssey.vpk` (y sincronizados en raíz).
   - Eliminados archivos basura `._*` con `psvita-toolkit clean-junk`.
+
+## Sesión 2026-09-15 (noche) — Crash montando el caballo: `HudWidget*` colgante en `is_widget_active`
+
+- **Reporte del usuario:** crash jugando con el caballo, con `log_20260915_224125.txt` +
+  `sacredodyssey-psp2core-1789526698-0x001c0526ed-eboot.bin.psp2dmp` de esa misma corrida. Además,
+  reportó (sin dump propio, ver más abajo) personaje con texturas parcialmente negras y bajones de FPS.
+- **Triage (`so-crash-triage`):**
+  - `vita-parse-core` contra `build/sacredodyssey.elf` (mismo build que generó el dump, timestamps
+    coinciden): `Data abort exception`, `PC: 0x81002876 (sacredodyssey@1 + 0x2876)` -- **dentro de
+    nuestro propio loader**, no del `.so` del juego.
+  - El PC cae en `is_widget_active` (`source/controls.c`), instrucción `ldrb r3, [r3, #0]` leyendo
+    `widget + 0x18` (el flag visible/activo de `HudWidget`, según la convención documentada en la
+    sesión anterior de mapeo de botones).
+  - `LR`/stack: la llamada vino de `get_widget_pos(HUD_OFFSET_TUTORIAL_DLG=104, ...)` en
+    `controls_update()` (retorno a `0x81003295`, que resuelve exactamente al `bl get_widget_pos` con
+    `r0=104` en el bloque de la Cruz -- `source/controls.c` línea ~264), confirmado desensamblando
+    `controls_update` con `arm-vita-eabi-objdump -d -M force-thumb`.
+  - El offset 104 para `button_HudTurtorialDialogInGame` es correcto (verificado contra
+    `Hud::InitHudWidgets` en `decompiled/decompiled_so/libsacredodyssey_v106/out_ghidra.c:78976-78977`:
+    `in_r0[0x1a] = FindWidgetByName(..., "button_HudTurtorialDialogInGame")`, `0x1a * 4 = 0x68 = 104`).
+    `HudWidget::FindWidgetByName` (línea 25382) devuelve `NULL` correctamente cuando no encuentra el
+    widget, así que no es un bug de offset ni de esa función.
+  - El valor real de `widget` en el momento del crash (leído del stack/registros del dump) era
+    `0x4620656e` -- **no nulo, pero no 4-byte-alineado** (un `HudWidget*` real, con vtable, siempre lo
+    está). Es decir: el slot de Hud para ese widget quedó con un puntero colgante/basura (probablemente
+    de una reasignación de memoria del motor durante la transición de montar el caballo, coincide con
+    que justo antes del corte el log mostraba `sfx_text_scroll.kow` reabriéndose 50 veces en 1.4s --
+    señal de un diálogo/tutorial en pantalla en ese instante), no algo que nuestro código pueda evitar
+    desde el lado del offset.
+- **Fix (`source/controls.c`):** guarda de alineación en `is_widget_active()` (`if (widget & 0x3) return
+  false;`, antes de tocar `widget + 0x18`) y en `get_widget_pos()` sobre el propio puntero `hud`. Un
+  `HudWidget*`/`Hud*` real jamás puede estar desalineado, así que el chequeo no puede rechazar un puntero
+  válido -- solo evita el data abort cuando el motor deja basura en la tabla de widgets, cayendo al mismo
+  fallback de coordenadas fijas que ya usan todos los llamadores de `controls_update()` cuando
+  `get_widget_pos()` devuelve `false`.
+- **Hallazgo aparte, con causa confirmada — texturas parcialmente negras:** el mismo log muestra, en la
+  zona del caballo, `invalid bind symbol: texture2` / `unbound parameter texture for shader
+  UnlitOneTextureAndVertexColorVP.glslUnlitMultiTexturedFP.glsl` / `Unused parameter: texture2`
+  (`os::Printer::log("invalid bind symbol", ...)`, confirmado nativo del motor en
+  `out_ghidra.c:341794` y alrededores, no algo que agreguemos nosotros). Una sesión anterior ya había
+  detectado que la segunda unidad de textura de `UnlitMultiTexturedFP.glsl` se declaraba sin usarse y la
+  arregló añadiendo el muestreo -- pero la nombró `texture1`, mientras que el binder real del motor pide
+  literalmente `texture2` (confirmado por el nombre exacto en el log de ESTA corrida). Con el nombre
+  equivocado la uniform seguía sin bindearse nunca (mismo síntoma en el log que antes del fix previo),
+  dejando sin su segunda textura cualquier superficie multi-texturizada del personaje/objetos.
+  - **Fix:** renombrado `texture1` → `texture2` (y la guarda que evita ennegrecer si la segunda unidad
+    viene vacía) en `source/utils/embedded_shaders.c` (la copia que realmente se instala en consola vía
+    `ensure_embedded_shaders_installed()`) y en `extras/shaders/UnlitMultiTexturedFP.glsl` (la copia
+    empaquetada en el VPK, para que ambas queden en sync).
+- **Hallazgo aparte, ya documentado -- bajones de FPS:** el mismo log muestra
+  `invalid bind symbol: WeightMask` repetido 500x justo antes de la caída a fps=1.6 en frame=1140 (zona
+  con muchas mallas animadas cargando a la vez: caballo, Princess, spider, rabbit, bucks). Esto coincide
+  exactamente con la limitación ya documentada arriba en `source/utils/embedded_shaders.c` (comentario de
+  la sesión del crash `1789184124`): los arrays de skinning (`BoneMatrices`/`BoneQuat0/1`/`WeightMask`/
+  `BoneTexture`) se sacaron a propósito de `ProfileCOMMON_emul_VS.glsl` porque el binder exige que su
+  tamaño coincida EXACTO con el bone count de cada malla, y ningún tamaño estático sirve para todas
+  (`mc.bdae`: Bone1..23, `magic_horse`: Bone1..26) -- sin ellos el bind falla "graceful" (spam de log +
+  malla en bind pose) en vez de crashear. El spam de "invalid bind symbol" por cada malla skinneada en
+  pantalla es, con alta probabilidad, el costo de ese fallback aceptado -- no es un bug nuevo de esta
+  sesión, es el mismo trade-off ya elegido. **No tocado en esta pasada** (arreglarlo de raíz requiere el
+  fix ya anotado en ese comentario: generar `ProfileCOMMON` por material con su propio bone count, no un
+  template estático -- trabajo grande, para una sesión dedicada).
+- **Validación:** build limpio (`psvita-toolkit build --preset debug`), `eboot.bin` regenerado y subido a
+  consola con `psvita-toolkit deploy --eboot --yes`.
+- **Pendiente (consola):** confirmar en una corrida real que ya no crashea al montar el caballo /
+  interactuar con el diálogo tutorial, que las superficies multi-texturizadas del personaje ya no se ven
+  negras, y evaluar si el bajón de FPS en zonas con muchas mallas animadas mejora o sigue igual (si sigue
+  igual, confirma que el spam de skinning es la causa y habría que abordar el fix grande de arriba).
