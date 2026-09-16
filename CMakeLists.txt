@@ -59,6 +59,24 @@ if (CMAKE_BUILD_TYPE STREQUAL "Debug")
   #add_definitions(-DFALSOJNI_DEBUGLEVEL=0)
 endif()
 
+# Space-separated flags passed to vitaGL's own Makefile (built from source,
+# see the vitaGL_build target below -- not the vdpm prebuilt package).
+# NO_SPLASHSCREEN=1 is required: this port depends on vitaGL not showing its
+# own startup splashscreen (previously achieved by hand-patching the global
+# VitaSDK install, which silently affected every other port sharing that SDK
+# -- vendorizing vitaGL here removes that footgun). SOFTFP_ABI=1 matches this
+# port's ABI (armeabi/soft-float, see PORTING_PLAN.md and the
+# -mfloat-abi=softfp flag below), same as the sibling Gameloft "Glitch"-engine
+# port Asphalt-5-Vita on this same ABI. HAVE_SHADER_CACHE=1: fast file cache
+# (xxHash-checked) of compiled shaders -- safe (pure cache, no pipeline change)
+# and directly attacks this port's slowest stall: every boot recompiles all of
+# the engine's GLSL programs through ShaccCg inside a single nativeRender frame
+# (the overlay bar visibly freezes for seconds). First boot after this change
+# pays the cost once; later boots reuse the cache. Deliberately NOT enabling any
+# *SPEEDHACK/NO_DEBUG-style flags (README VITAGL.md marks them all as potential
+# crash/glitch sources) while the port is still stabilizing.
+set(VITAGL_MAKE_FLAGS "SOFTFP_ABI=1 NO_SPLASHSCREEN=1 HAVE_SHADER_CACHE=1 NO_DEBUG=1 SAMPLERS_SPEEDHACK=1 CIRCULAR_POOL_SPEEDHACK=1 DRAW_SPEEDHACK=2 NO_TEX_COMBINER=1")
+
 # makes sincos, sincosf, etc. visible
 add_definitions(-D_GNU_SOURCE -D__POSIX_VISIBLE=999999)
 
@@ -70,8 +88,10 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/dynlib.c
                source/java.c
                source/patch.c
+               source/controls.c
                source/reimpl/bits/_ctype.c
                source/reimpl/errno.c
+               source/reimpl/fmt.c
                source/reimpl/io.c
                source/reimpl/log.c
                source/reimpl/mem.c
@@ -80,6 +100,7 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/reimpl/time64.c
                source/reimpl/asset_manager.cpp
                source/utils/dialog.c
+               source/utils/embedded_shaders.c
                source/utils/glutil.c
                source/utils/init.c
                source/utils/logger.c
@@ -94,6 +115,42 @@ add_executable(${CMAKE_PROJECT_NAME}
 
 add_subdirectory(lib/libc_bridge)
 add_dependencies(${CMAKE_PROJECT_NAME} SceLibcBridge)
+
+# VitaGL built from lib/vitagl (git submodule) via its own Makefile, instead
+# of linking the generic vdpm-installed prebuilt package -- so VITAGL_MAKE_FLAGS
+# above (NO_SPLASHSCREEN=1 in particular) actually takes effect without
+# mutating the global VitaSDK install shared by other ports.
+separate_arguments(VITAGL_MAKE_ARGS UNIX_COMMAND "${VITAGL_MAKE_FLAGS}")
+
+set(VITAGL_DIR ${CMAKE_SOURCE_DIR}/lib/vitagl)
+set(VITAGL_LIB ${VITAGL_DIR}/libvitaGL.a)
+
+# Force a full rebuild of vitaGL whenever VITAGL_MAKE_FLAGS change
+set(VITAGL_FLAGS_STAMP ${CMAKE_BINARY_DIR}/vitagl_flags.stamp)
+set(vitagl_old_flags "")
+if (EXISTS ${VITAGL_FLAGS_STAMP})
+  file(READ ${VITAGL_FLAGS_STAMP} vitagl_old_flags)
+endif()
+if (NOT vitagl_old_flags STREQUAL VITAGL_MAKE_FLAGS)
+  file(GLOB_RECURSE vitagl_stale_objs ${VITAGL_DIR}/source/*.o)
+  file(REMOVE ${vitagl_stale_objs} ${VITAGL_LIB})
+  file(WRITE ${VITAGL_FLAGS_STAMP} "${VITAGL_MAKE_FLAGS}")
+endif()
+
+# Keep VitaGL builds deterministic and within the port's low-memory budget.
+set(VITAGL_NPROC 1)
+
+add_custom_target(vitaGL_build
+                  COMMAND make -C ${VITAGL_DIR} -j${VITAGL_NPROC} ${VITAGL_MAKE_ARGS}
+                  BYPRODUCTS ${VITAGL_LIB}
+                  COMMENT "Building VitaGL"
+                  VERBATIM)
+
+add_library(vitaGL STATIC IMPORTED)
+set_target_properties(vitaGL PROPERTIES
+                      IMPORTED_LOCATION ${VITAGL_LIB}
+                      INTERFACE_INCLUDE_DIRECTORIES ${VITAGL_DIR}/source)
+add_dependencies(${CMAKE_PROJECT_NAME} vitaGL_build)
 
 target_include_directories(${CMAKE_PROJECT_NAME} SYSTEM
                            PUBLIC ${CMAKE_SOURCE_DIR}/lib
@@ -146,6 +203,16 @@ vita_create_vpk(${VITA_VPKNAME}.vpk ${VITA_TITLEID} eboot.bin
                 "${CMAKE_SOURCE_DIR}/extras/meminfo" meminfo
                 "${CMAKE_SOURCE_DIR}/extras/PinkBadShaderVP.glsl" PinkBadShaderVP.glsl
                 "${CMAKE_SOURCE_DIR}/extras/PinkBadShaderFP.glsl" PinkBadShaderFP.glsl
+                "${CMAKE_SOURCE_DIR}/extras/shaders/ProfileCOMMON_emul_VS.glsl" shaders/ProfileCOMMON_emul_VS.glsl
+                "${CMAKE_SOURCE_DIR}/extras/shaders/ProfileCOMMON_emul_FS.glsl" shaders/ProfileCOMMON_emul_FS.glsl
+                "${CMAKE_SOURCE_DIR}/extras/shaders/UnlitOneTextureAndVertexColorVP.glsl" shaders/UnlitOneTextureAndVertexColorVP.glsl
+                "${CMAKE_SOURCE_DIR}/extras/shaders/UnlitTexturedFP.glsl" shaders/UnlitTexturedFP.glsl
+                "${CMAKE_SOURCE_DIR}/extras/shaders/UnlitTexturedBlendTextureAlphaFP.glsl" shaders/UnlitTexturedBlendTextureAlphaFP.glsl
+                "${CMAKE_SOURCE_DIR}/extras/shaders/UnlitMultiTexturedFP.glsl" shaders/UnlitMultiTexturedFP.glsl
+                "${CMAKE_SOURCE_DIR}/extras/shaders/UnlitVertexColorVP.glsl" shaders/UnlitVertexColorVP.glsl
+                "${CMAKE_SOURCE_DIR}/extras/shaders/UnlitVertexColorFP.glsl" shaders/UnlitVertexColorFP.glsl
+                "${CMAKE_SOURCE_DIR}/extras/shaders/UnlitMaterialColorVP.glsl" shaders/UnlitMaterialColorVP.glsl
+                "${CMAKE_SOURCE_DIR}/extras/shaders/UnlitMaterialColorFP.glsl" shaders/UnlitMaterialColorFP.glsl
                 "${CMAKE_SOURCE_DIR}/extras/livearea/icon0.png" sce_sys/icon0.png
                 "${CMAKE_SOURCE_DIR}/extras/livearea/pic0.png" sce_sys/pic0.png
                 "${CMAKE_SOURCE_DIR}/extras/livearea/startup.png" sce_sys/livearea/contents/startup.png

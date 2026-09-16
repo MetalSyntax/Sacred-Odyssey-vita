@@ -71,6 +71,8 @@ int open_soloader(const char * path, int oflag, ...);
 
 FILE * fopen_soloader(const char * filename, const char * mode);
 
+size_t fread_soloader(void *ptr, size_t size, size_t nmemb, FILE *stream);
+
 DIR *opendir_soloader(char *name);
 
 int stat_soloader(const char * path, stat64_bionic * buf);

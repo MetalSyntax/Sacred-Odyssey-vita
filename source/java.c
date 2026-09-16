@@ -122,12 +122,12 @@ static jint integer_one(jmethodID id, va_list args) {
 
 static jint integer_width(jmethodID id, va_list args) {
     (void)id; (void)args;
-    return 960;
+    return 800; // espacio del engine (ver SCREEN_W/H en main.c)
 }
 
 static jint integer_height(jmethodID id, va_list args) {
     (void)id; (void)args;
-    return 544;
+    return 480;
 }
 
 static jint integer_manufacturer_sony(jmethodID id, va_list args) {

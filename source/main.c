@@ -2,6 +2,7 @@
 #include "utils/glutil.h"
 #include "utils/logger.h"
 #include "utils/dialog.h"
+#include "controls.h"
 
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/kernel/processmgr.h>
@@ -36,8 +37,14 @@ int sceLibcHeapSize = 32 * 1024 * 1024;
 
 so_module so_mod;
 
-#define SCREEN_W 960
-#define SCREEN_H 544
+// Resolución reportada al engine (el layout de menús/UI del motor necesita
+// EXACTAMENTE 800x480, confirmado en hardware que 960x544 rompe el layout).
+// El engine dibuja DIRECTO sobre el framebuffer real -- ningún FBO
+// intermedio -- y glViewport_soloader/glScissor_soloader (glutil.c) reescalan
+// cada rect de su espacio 800x480 a los 960x544 reales antes de tocar la GPU.
+// El táctil mapea del panel (1920x1088) a este mismo espacio 800x480.
+#define SCREEN_W 800
+#define SCREEN_H 480
 
 // Native function pointer types
 typedef void (*so_void_fn)(JNIEnv *, jobject);
@@ -113,6 +120,7 @@ int main(void) {
     sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_0);
 
     l_info("Starting Sacred Odyssey loader initialization...");
+    l_info("eboot build stamp: %s %s", __DATE__, __TIME__);
     soloader_init_all();
 
     int (*JNI_OnLoad)(void *jvm) = (void *)so_symbol(&so_mod, "JNI_OnLoad");
@@ -150,14 +158,9 @@ int main(void) {
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
 
-    SceCtrlData pad;
-    SceTouchData touch;
-    SceTouchData touch_old;
-    memset(&touch, 0, sizeof(touch));
-    memset(&touch_old, 0, sizeof(touch_old));
+    // Initialize physical-to-virtual controls mapping, analog stick hooks, and widget tracking
+    controls_init(nativeGameGLSurfaceViewOnTouch, nativeOnKeyDown, nativeOnKeyUp, &jni);
 
-    uint32_t old_buttons = 0;
-    uint32_t current_buttons = 0;
     // Ensure initial video/pause flags allow normal rendering
     volatile uint8_t *v_isVideoFinish = (volatile uint8_t *)so_symbol(&so_mod, "isVideoFinish");
     if (v_isVideoFinish) *v_isVideoFinish = 1;
@@ -173,75 +176,21 @@ int main(void) {
     int frame_count = 0;
     SceRtcTick last_fps_tick;
     sceRtcGetCurrentTick(&last_fps_tick);
+    // Tracks whether fps has recovered from the real, one-time boot stall
+    // (shader translation + first scene load: minutes of near-0 fps, confirmed
+    // in port_progress.md) -- pure [render_diag] telemetry now (the debug-only
+    // loading-bar overlay that used to key off this was removed: the game has
+    // its own loading screen). Latched permanently once fast, so a later,
+    // unrelated one-frame hiccup can't flip it back.
+    int loading_done = 0;
 
     while (1) {
         sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
 
-        // Controller buttons
-        if (sceCtrlPeekBufferPositive(0, &pad, 1) > 0) {
-            old_buttons = current_buttons;
-            current_buttons = pad.buttons;
-            uint32_t pressed = current_buttons & ~old_buttons;
-            uint32_t released = ~current_buttons & old_buttons;
+        // Update physical controls, analog sticks, virtual buttons, and touch slots
+        controls_update();
 
-            // START or CIRCLE -> KEYCODE_BACK (4)
-            if (pressed & (SCE_CTRL_START | SCE_CTRL_CIRCLE)) {
-                nativeOnKeyDown(&jni, NULL, 4);
-            }
-            if (released & (SCE_CTRL_START | SCE_CTRL_CIRCLE)) {
-                nativeOnKeyUp(&jni, NULL, 4);
-            }
-
-            // SELECT -> KEYCODE_MENU (82)
-            if (pressed & SCE_CTRL_SELECT) {
-                nativeOnKeyDown(&jni, NULL, 82);
-            }
-            if (released & SCE_CTRL_SELECT) {
-                nativeOnKeyUp(&jni, NULL, 82);
-            }
-        }
-
-        // Touch handling (front panel)
-        memcpy(&touch_old, &touch, sizeof(touch_old));
-        if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) > 0) {
-            for (int i = 0; i < touch.reportNum; i++) {
-                int x = (int)(touch.report[i].x * SCREEN_W / 1920.0f);
-                int y = (int)(touch.report[i].y * SCREEN_H / 1088.0f);
-                int id = touch.report[i].id;
-
-                int found = 0;
-                for (int j = 0; j < touch_old.reportNum; j++) {
-                    if (touch_old.report[j].id == id) {
-                        found = 1;
-                        break;
-                    }
-                }
-
-                if (!found) {
-                    nativeGameGLSurfaceViewOnTouch(&jni, NULL, 1, x, y, id);
-                } else {
-                    nativeGameGLSurfaceViewOnTouch(&jni, NULL, 2, x, y, id);
-                }
-            }
-
-            for (int j = 0; j < touch_old.reportNum; j++) {
-                int old_id = touch_old.report[j].id;
-                int still_present = 0;
-                for (int i = 0; i < touch.reportNum; i++) {
-                    if (touch.report[i].id == old_id) {
-                        still_present = 1;
-                        break;
-                    }
-                }
-                if (!still_present) {
-                    int old_x = (int)(touch_old.report[j].x * SCREEN_W / 1920.0f);
-                    int old_y = (int)(touch_old.report[j].y * SCREEN_H / 1088.0f);
-                    nativeGameGLSurfaceViewOnTouch(&jni, NULL, 0, old_x, old_y, old_id);
-                }
-            }
-        }
-
-        // Render frame
+        // Render frame, then swap.
         nativeGameRendererRender(&jni, NULL);
         gl_swap();
 
@@ -252,6 +201,17 @@ int main(void) {
             uint64_t elapsed_us = now_tick.tick - last_fps_tick.tick;
             float fps = (elapsed_us > 0) ? (60.0f * 1000000.0f / (float)elapsed_us) : 0.0f;
             last_fps_tick = now_tick;
+
+            // A window this slow can only be the one-time boot stall (shader
+            // translation / first scene load) -- confirmed dropping to
+            // fps=0.4 for a whole 60-frame window in log_20260910_013817.txt.
+            // Once a full window clears comfortably above that, loading is
+            // over; latch permanently so a later, unrelated one-frame hiccup
+            // can't flip it back.
+            if (!loading_done && fps > 30.0f) {
+                loading_done = 1;
+                l_info("[render_diag] boot stall cleared (fps=%.1f)", fps);
+            }
 
             GLenum err = glGetError();
             l_info("[render_diag] frame=%d fps=%.1f glGetError=0x%04x (alive=%u, paused=%u, movie=%u)",

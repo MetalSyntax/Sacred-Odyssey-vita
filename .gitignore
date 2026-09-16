@@ -26,7 +26,11 @@ assets/
 /build/
 CMakeCache.txt
 CMakeFiles/
-Makefile
+# Anchored to the repo root: an unanchored "Makefile" here would also match
+# (and, via the toolkit's build-time rsync --filter=":- .gitignore", strip)
+# lib/vitagl/Makefile -- a real, hand-written source file of the vendored
+# vitaGL submodule, not a generated artifact.
+/Makefile
 cmake_install.cmake
 *.elf
 *.self
@@ -52,3 +56,13 @@ __pycache__/
 *.swp
 cmake-build-*/
 compile_commands.json
+GloftSOHP.v101-adreno.old/
+res.v103-powervr.old/
+sacredodyssey_extract.v103-powervr/
+screenshots/
+
+# Backups de assets de LiveArea y capturas/portadas de referencia sueltas en
+# la raíz -- no son parte del port, solo material de trabajo local
+extras/livearea/*.bak
+/Sacred-Odyssey-Rise-Of-Ayden-Screenshots-*.png
+/Sacred_Odyssey_Rise_of_Ayden.jpg

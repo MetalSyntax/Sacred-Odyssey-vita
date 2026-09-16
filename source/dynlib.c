@@ -45,6 +45,7 @@
 #endif
 
 #include "reimpl/errno.h"
+#include "reimpl/fmt.h"
 #include "reimpl/io.h"
 #include "reimpl/log.h"
 #include "reimpl/mem.h"
@@ -391,7 +392,7 @@ so_default_dynlib default_dynlib[] = {
             { "fileno", (uintptr_t)&sceLibcBridge_fileno },
             { "fputc", (uintptr_t)&sceLibcBridge_fputc },
             { "fputs", (uintptr_t)&sceLibcBridge_fputs },
-            { "fread", (uintptr_t)&sceLibcBridge_fread },
+            { "fread", (uintptr_t)&fread_soloader },
             { "freopen", (uintptr_t)&sceLibcBridge_freopen },
             { "fseek", (uintptr_t)&sceLibcBridge_fseek },
             { "fsetpos", (uintptr_t)&sceLibcBridge_fsetpos },
@@ -418,7 +419,7 @@ so_default_dynlib default_dynlib[] = {
             { "fileno", (uintptr_t)&fileno },
             { "fputc", (uintptr_t)&fputc },
             { "fputs", (uintptr_t)&fputs },
-            { "fread", (uintptr_t)&fread },
+            { "fread", (uintptr_t)&fread_soloader },
             { "freopen", (uintptr_t)&freopen },
             { "fseek", (uintptr_t)&fseek },
             { "fsetpos", (uintptr_t)&fsetpos },
@@ -461,12 +462,18 @@ so_default_dynlib default_dynlib[] = {
 
 
         // *printf, *scanf
-        { "snprintf", (uintptr_t)&snprintf },
-        { "sprintf", (uintptr_t)&sprintf },
+        // sprintf/snprintf/vsprintf/vsnprintf are routed through crash-safe wrappers
+        // (source/reimpl/fmt.c) -- confirmed on real hardware that the .so can call these
+        // with a %s argument pointing at an invalid pointer (0xfffffff8 observed, dump
+        // sacredodyssey-psp2core-1788539515-...), crashing inside strlen()/_svfprintf_r()
+        // before ever reaching the main menu. The wrappers validate %s pointers first and
+        // defer to the real implementation unchanged for every already-working call.
+        { "snprintf", (uintptr_t)&snprintf_soloader },
+        { "sprintf", (uintptr_t)&sprintf_soloader },
         { "vasprintf", (uintptr_t)&vasprintf },
         { "vprintf", (uintptr_t)&vprintf },
-        { "vsnprintf", (uintptr_t)&vsnprintf },
-        { "vsprintf", (uintptr_t)&vsprintf },
+        { "vsnprintf", (uintptr_t)&vsnprintf_soloader },
+        { "vsprintf", (uintptr_t)&vsprintf_soloader },
         { "vsscanf", (uintptr_t)&vsscanf },
         { "vswprintf", (uintptr_t)&vswprintf },
         { "printf", (uintptr_t)&sceClibPrintf },
@@ -514,8 +521,8 @@ so_default_dynlib default_dynlib[] = {
         { "glAttachShader", (uintptr_t)&glAttachShader },
         { "glBindAttribLocation", (uintptr_t)&glBindAttribLocation },
         { "glBindBuffer", (uintptr_t)&glBindBuffer },
-        { "glBindFramebuffer", (uintptr_t)&glBindFramebuffer },
-        { "glBindFramebufferOES", (uintptr_t)&glBindFramebuffer },
+        { "glBindFramebuffer", (uintptr_t)&glBindFramebuffer_soloader },
+        { "glBindFramebufferOES", (uintptr_t)&glBindFramebuffer_soloader },
         { "glBindRenderbuffer", (uintptr_t)&glBindRenderbuffer },
         { "glBindRenderbufferOES", (uintptr_t)&glBindRenderbuffer },
         { "glBindTexture", (uintptr_t)&glBindTexture },
@@ -546,7 +553,7 @@ so_default_dynlib default_dynlib[] = {
         { "glColorMask", (uintptr_t)&glColorMask },
         { "glColorPointer", (uintptr_t)&glColorPointer },
         { "glCompileShader", (uintptr_t)&glCompileShader_soloader },
-        { "glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2D },
+        { "glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2D_soloader },
         { "glCompressedTexSubImage2D", (uintptr_t)&ret0 },
         { "glCopyTexImage2D", (uintptr_t)&glCopyTexImage2D },
         { "glCopyTexSubImage2D", (uintptr_t)&glCopyTexSubImage2D },
@@ -640,7 +647,7 @@ so_default_dynlib default_dynlib[] = {
         { "glGetTexParameterfv", (uintptr_t)&ret0 },
         { "glGetTexParameteriv", (uintptr_t)&ret0 },
         { "glGetTexParameterxv", (uintptr_t)&ret0 },
-        { "glGetUniformLocation", (uintptr_t)&glGetUniformLocation },
+        { "glGetUniformLocation", (uintptr_t)&glGetUniformLocation_soloader },
         { "glHint", (uintptr_t)&glHint },
         { "glIsBuffer", (uintptr_t)&ret0 },
         { "glIsEnabled", (uintptr_t)&glIsEnabled },
@@ -702,7 +709,7 @@ so_default_dynlib default_dynlib[] = {
         { "glSampleCoveragex", (uintptr_t)&ret0 },
         { "glScalef", (uintptr_t)&glScalef },
         { "glScalex", (uintptr_t)&glScalex },
-        { "glScissor", (uintptr_t)&glScissor },
+        { "glScissor", (uintptr_t)&glScissor_soloader },
         { "glShadeModel", (uintptr_t)&glShadeModel },
         { "glShaderSource", (uintptr_t)&glShaderSource_soloader },
         { "glStencilFunc", (uintptr_t)&glStencilFunc },
@@ -723,19 +730,19 @@ so_default_dynlib default_dynlib[] = {
         { "glTexGenivOES", (uintptr_t)&ret0 },
         { "glTexGenxOES", (uintptr_t)&ret0 },
         { "glTexGenxvOES", (uintptr_t)&ret0 },
-        { "glTexImage2D", (uintptr_t)&glTexImage2D },
+        { "glTexImage2D", (uintptr_t)&glTexImage2D_soloader },
         { "glTexParameterf", (uintptr_t)&glTexParameterf },
         { "glTexParameterfv", (uintptr_t)&ret0 },
         { "glTexParameteri", (uintptr_t)&glTexParameteri },
         { "glTexParameteriv", (uintptr_t)&glTexParameteriv },
         { "glTexParameterx", (uintptr_t)&glTexParameterx },
         { "glTexParameterxv", (uintptr_t)&ret0 },
-        { "glTexSubImage2D", (uintptr_t)&glTexSubImage2D },
+        { "glTexSubImage2D", (uintptr_t)&glTexSubImage2D_soloader },
         { "glTranslatef", (uintptr_t)&glTranslatef },
         { "glTranslatex", (uintptr_t)&glTranslatex },
         { "glUniform1f", (uintptr_t)&glUniform1f },
         { "glUniform1fv", (uintptr_t)&glUniform1fv },
-        { "glUniform1i", (uintptr_t)&glUniform1i },
+        { "glUniform1i", (uintptr_t)&glUniform1i_soloader },
         { "glUniform1iv", (uintptr_t)&glUniform1iv },
         { "glUniform2f", (uintptr_t)&glUniform2f },
         { "glUniform2fv", (uintptr_t)&glUniform2fv },
@@ -744,20 +751,20 @@ so_default_dynlib default_dynlib[] = {
         { "glUniform3fv", (uintptr_t)&glUniform3fv },
         { "glUniform3iv", (uintptr_t)&glUniform3iv },
         { "glUniform4f", (uintptr_t)&glUniform4f },
-        { "glUniform4fv", (uintptr_t)&glUniform4fv },
+        { "glUniform4fv", (uintptr_t)&glUniform4fv_soloader },
         { "glUniform4iv", (uintptr_t)&glUniform4iv },
         { "glUniformMatrix2fv", (uintptr_t)&glUniformMatrix2fv },
         { "glUniformMatrix3fv", (uintptr_t)&glUniformMatrix3fv },
         { "glUniformMatrix4fv", (uintptr_t)&glUniformMatrix4fv },
         { "glUnmapBuffer", (uintptr_t)&glUnmapBuffer },
         { "glUnmapBufferOES", (uintptr_t)&glUnmapBuffer },
-        { "glUseProgram", (uintptr_t)&glUseProgram },
+        { "glUseProgram", (uintptr_t)&glUseProgram_soloader },
         { "glValidateProgram", (uintptr_t)&ret0 },
         { "glVertexAttrib4f", (uintptr_t)&glVertexAttrib4f },
         { "glVertexAttrib4fv", (uintptr_t)&glVertexAttrib4fv },
         { "glVertexAttribPointer", (uintptr_t)&glVertexAttribPointer },
         { "glVertexPointer", (uintptr_t)&glVertexPointer },
-        { "glViewport", (uintptr_t)&glViewport },
+        { "glViewport", (uintptr_t)&glViewport_soloader },
         { "glWeightPointerOES", (uintptr_t)&ret0 },
 
 
