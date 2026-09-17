@@ -72,6 +72,29 @@ int open_soloader(const char * path, int oflag, ...);
 FILE * fopen_soloader(const char * filename, const char * mode);
 
 size_t fread_soloader(void *ptr, size_t size, size_t nmemb, FILE *stream);
+size_t fwrite_soloader(const void *ptr, size_t size, size_t nmemb, FILE *stream);
+int fseek_soloader(FILE *stream, long offset, int whence);
+long ftell_soloader(FILE *stream);
+int fseeko_soloader(FILE *stream, off_t offset, int whence);
+off_t ftello_soloader(FILE *stream);
+void rewind_soloader(FILE *stream);
+int feof_soloader(FILE *stream);
+int ferror_soloader(FILE *stream);
+int fflush_soloader(FILE *stream);
+int fgetc_soloader(FILE *stream);
+int getc_soloader(FILE *stream);
+int fputc_soloader(int c, FILE *stream);
+int putc_soloader(int c, FILE *stream);
+char *fgets_soloader(char *s, int size, FILE *stream);
+int fputs_soloader(const char *s, FILE *stream);
+int fileno_soloader(FILE *stream);
+int setvbuf_soloader(FILE *stream, char *buf, int mode, size_t size);
+int ungetc_soloader(int c, FILE *stream);
+
+ssize_t write_soloader(int fd, const void *buf, size_t count);
+int unlink_soloader(const char *path);
+int remove_soloader(const char *path);
+int rename_soloader(const char *oldpath, const char *newpath);
 
 DIR *opendir_soloader(char *name);
 

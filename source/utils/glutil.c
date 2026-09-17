@@ -111,6 +111,9 @@ void gl_init() {
     if (vgl_initialized) return;
     vgl_initialized = 1;
 
+    file_mkpath(DATA_PATH "cache/shaders/", 0777);
+    vglSetShaderCachePath(DATA_PATH "cache/shaders");
+
     vglInitExtended(0, 960, 544, 6 * 1024 * 1024, SCE_GXM_MULTISAMPLE_4X);
 }
 
@@ -347,6 +350,30 @@ void glLinkProgram_soloader(GLuint program) {
             l_info("[program_init] program %u: initialized %s to identity", program, s_texmats[i]);
         }
     }
+    // Force texture1/texture2 (UnlitMultiTexturedFP.glsl) away from texture
+    // unit 0 by default. GLSL leaves an unset sampler uniform at its default
+    // value (0), same unit "texture" itself uses -- if a material only ever
+    // sets ONE of the two literal names (see embedded_shaders.c), the other
+    // one would silently sample the SAME image as the primary diffuse
+    // texture, pass the ">0.03 signal" guard trivially (it's a real image,
+    // not black), and multiply color by itself: a wrong darkening, not the
+    // "just skip it" behavior the guard is meant to provide. Unit 7 is
+    // guaranteed to exist (GLES2 requires >=8 image units) and nothing in
+    // this port ever binds a real texture there, so it reads back
+    // (0,0,0,0) until/unless the material's own binder overwrites it.
+    static const char *s_second_tex_units[] = { "texture1", "texture2" };
+    for (size_t i = 0; i < sizeof(s_second_tex_units) / sizeof(s_second_tex_units[0]); i++) {
+        GLint loc = glGetUniformLocation(program, s_second_tex_units[i]);
+        if (loc >= 0) {
+            if (prev_program < 0) {
+                glGetIntegerv(GL_CURRENT_PROGRAM, &prev_program);
+                glUseProgram(program);
+            }
+            glUniform1i(loc, 7);
+            l_info("[program_init] program %u: defaulted %s to empty unit 7", program, s_second_tex_units[i]);
+        }
+    }
+
     if (prev_program >= 0) {
         glUseProgram((GLuint)prev_program);
     }

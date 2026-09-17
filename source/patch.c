@@ -15,6 +15,7 @@
 #include <so_util/so_util.h>
 #include "utils/logger.h"
 #include "utils/glutil.h"
+#include "utils/utils.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -77,21 +78,45 @@ static void license_load_config_stub(void) {
     l_info("ALicenseCheck::LoadConfig bypassed");
 }
 
+// Trampolin de 20 bytes reservado en la zona de padding post-LoadWorld (ver
+// parche 0x2171a8 en so_patch_v106()). El codigo Thumb-2 original hace
+// LDR R3, [PC, #0x238] que cargaba 0x3463e8; sustituimos ese puntero literal
+// por la direccion de este trampolin.
+//
+// Estructura del trampolin (Thumb-2):
+//   push {r0-r3, lr}     ; salvar registros scratch y return address
+//   ldr  r3, =world_load_yield ; cargar direccion del callback C
+//   blx  r3              ; invocar C (reserva su propio stack frame)
+//   pop  {r0-r3, lr}     ; restaurar estado exacto de la funcion llamante
+//   ldr  r3, =0x2171af   ; saltar de vuelta a la siguiente instruccion (Thumb)
+//   bx   r3
+//
+// Codigo de maquina emitido por so_patch_v106():
+//   b50f            push {r0-r3, lr}
+//   4b02            ldr  r3, [pc, #8]  ; apunta a .word de world_load_yield
+//   4798            blx  r3
+//   bd0f            pop  {r0-r3, pc}   ; o pop + bx -- usamos pop {r0-r3, lr} + bx r3
+//
+// Para mantener el trampolin lo mas simple posible en memoria de codigo,
+// usamos un trampolin en C registrado directamente via puntero de funcion
+// si el slot original era una llamada indirecta, o escribimos un trampolin
+// Thumb-2 minimo en el hueco libre si era un BL. Ver so_patch_v106() para
+// el detalle del ensamblado en runtime.
+
 // Llamado desde el trampolin de World::LoadMap (ver so_patch_v106, sitio
 // 0x2171aa): el do/while de "World loading: game objects" carga ~100+
 // objetos en una sola pasada sin ceder el control al loop principal, asi que
 // ningun gl_swap() ocurre hasta que termina -- confirmado en
 // log_20260912_020011.txt (fps cae a 2.2-2.5 exactamente durante
-// "LoadWorld()"/justo tras "MainCharacter::SaveAll!"). Throttle a 1 de cada 4
-// llamadas (cada game object dispara esto una vez) para no pagar un
-// vglSwapBuffers de mas por objeto. El juego tiene su propia pantalla/barra
-// de carga (se sigue redibujando con cada swap); esto solo asegura que ese
-// redibujado en si ocurra durante la carga en vez de quedar bloqueado hasta
-// que el do/while completo termine. NO reduce el tiempo total de carga.
+// "LoadWorld()"/justo tras "MainCharacter::SaveAll!").
+// Throttle por tiempo (150ms): mantiene la barra de carga animada y receptiva
+// eliminando docenas de llamadas bloqueantes a vglSwapBuffers (cada una espera VBLANK ~16ms),
+// ahorrando cientos de milisegundos de espera ociosa en la carga de partida.
 static void world_load_yield(void) {
-    static unsigned call_count = 0;
-    call_count++;
-    if ((call_count % 4) != 0) return;
+    static uint64_t last_swap_ms = 0;
+    uint64_t now = current_timestamp_ms();
+    if (now - last_swap_ms < 150) return;
+    last_swap_ms = now;
     gl_swap();
 }
 

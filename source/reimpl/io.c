@@ -15,6 +15,8 @@
 #include <stdlib.h>
 #include <dirent.h>
 #include <stdarg.h>
+#include <pthread.h>
+#include <malloc.h>
 #include <psp2/kernel/threadmgr.h>
 
 #ifdef USE_SCELIBC_IO
@@ -324,11 +326,207 @@ static void storm_ring_add(FILE *f) {
     next = (next + 1) % STORM_RING_N;
 }
 
+#define FCACHE_ENABLED 1
+#define FCACHE_MAX_ENTRIES 512
+#define FCACHE_MAX_FILE_SIZE (8 * 1024 * 1024)
+#define FCACHE_MAX_TOTAL_BYTES (64 * 1024 * 1024)
+#define FCACHE_MAX_HANDLES 64
+#define NEG_CACHE_SIZE 1024
+
+typedef struct {
+    char path[256];
+    unsigned char *data;
+    long size;
+} FCacheEntry;
+
+typedef struct {
+    int entry_idx; // -1 = free slot
+    long pos;
+} FCacheHandle;
+
+static FCacheEntry s_fcache_entries[FCACHE_MAX_ENTRIES];
+static int s_fcache_entry_count = 0;
+static long s_fcache_total_bytes = 0;
+static FCacheHandle s_fcache_handles[FCACHE_MAX_HANDLES];
+static int s_fcache_handles_init = 0;
+static pthread_mutex_t s_fcache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static char s_neg_cache[NEG_CACHE_SIZE][256];
+static int s_neg_cache_count = 0;
+
+static inline int fcache_is_handle(void *f) {
+    uintptr_t p = (uintptr_t) f;
+    uintptr_t base = (uintptr_t) s_fcache_handles;
+    uintptr_t end = base + sizeof(s_fcache_handles);
+    return p >= base && p < end && ((p - base) % sizeof(FCacheHandle)) == 0;
+}
+
+static void fcache_init_handles_locked(void) {
+    if (s_fcache_handles_init) return;
+    for (int i = 0; i < FCACHE_MAX_HANDLES; i++) s_fcache_handles[i].entry_idx = -1;
+    s_fcache_handles_init = 1;
+}
+
+static int fcache_find_entry_locked(const char *path) {
+    for (int i = 0; i < s_fcache_entry_count; i++) {
+        if (strcmp(s_fcache_entries[i].path, path) == 0) return i;
+    }
+    return -1;
+}
+
+static FILE *fcache_open_handle_locked(int entry_idx) {
+    fcache_init_handles_locked();
+    for (int i = 0; i < FCACHE_MAX_HANDLES; i++) {
+        if (s_fcache_handles[i].entry_idx == -1) {
+            s_fcache_handles[i].entry_idx = entry_idx;
+            s_fcache_handles[i].pos = 0;
+            return (FILE *) &s_fcache_handles[i];
+        }
+    }
+    return NULL;
+}
+
+static inline int fcache_is_cacheable_mode(const char *mode) {
+#if !FCACHE_ENABLED
+    (void) mode;
+    return 0;
+#else
+    return mode && (strcmp(mode, "r") == 0 || strcmp(mode, "rb") == 0);
+#endif
+}
+
+void fcache_invalidate(const char *path) {
+    if (!path) return;
+    pthread_mutex_lock(&s_fcache_lock);
+    for (int i = 0; i < s_fcache_entry_count; i++) {
+        if (strcmp(s_fcache_entries[i].path, path) == 0) {
+            free(s_fcache_entries[i].data);
+            s_fcache_total_bytes -= s_fcache_entries[i].size;
+            s_fcache_entries[i] = s_fcache_entries[--s_fcache_entry_count];
+            l_debug("[fcache] invalidated %s", path);
+            break;
+        }
+    }
+    for (int i = 0; i < s_neg_cache_count; ) {
+        if (strcmp(s_neg_cache[i], path) == 0) {
+            if (i + 1 < s_neg_cache_count) {
+                memmove(&s_neg_cache[i], &s_neg_cache[i + 1],
+                        (size_t) (s_neg_cache_count - i - 1) * sizeof(s_neg_cache[0]));
+            }
+            s_neg_cache_count--;
+        } else {
+            i++;
+        }
+    }
+    pthread_mutex_unlock(&s_fcache_lock);
+}
+
+static void fcache_populate(const char *path, FILE *real_file) {
+    pthread_mutex_lock(&s_fcache_lock);
+    fcache_init_handles_locked();
+    if (s_fcache_entry_count >= FCACHE_MAX_ENTRIES || strlen(path) >= sizeof(s_fcache_entries[0].path)) {
+        pthread_mutex_unlock(&s_fcache_lock);
+        return;
+    }
+    pthread_mutex_unlock(&s_fcache_lock);
+
+#ifdef USE_SCELIBC_IO
+    sceLibcBridge_fseek(real_file, 0, SEEK_END);
+    long size = sceLibcBridge_ftell(real_file);
+    sceLibcBridge_fseek(real_file, 0, SEEK_SET);
+#else
+    fseek(real_file, 0, SEEK_END);
+    long size = ftell(real_file);
+    fseek(real_file, 0, SEEK_SET);
+#endif
+    if (size <= 0 || size > FCACHE_MAX_FILE_SIZE) return;
+
+    pthread_mutex_lock(&s_fcache_lock);
+    if (s_fcache_total_bytes + size > FCACHE_MAX_TOTAL_BYTES) {
+        pthread_mutex_unlock(&s_fcache_lock);
+        return;
+    }
+    pthread_mutex_unlock(&s_fcache_lock);
+
+    unsigned char *buf = (unsigned char *) malloc((size_t) size);
+    if (!buf) return;
+
+#ifdef USE_SCELIBC_IO
+    size_t got = sceLibcBridge_fread(buf, 1, (size_t) size, real_file);
+    sceLibcBridge_fseek(real_file, 0, SEEK_SET);
+#else
+    size_t got = fread(buf, 1, (size_t) size, real_file);
+    fseek(real_file, 0, SEEK_SET);
+#endif
+    if (got != (size_t) size) {
+        free(buf);
+        return;
+    }
+
+    pthread_mutex_lock(&s_fcache_lock);
+    if (s_fcache_entry_count >= FCACHE_MAX_ENTRIES || fcache_find_entry_locked(path) >= 0) {
+        pthread_mutex_unlock(&s_fcache_lock);
+        free(buf);
+        return;
+    }
+    FCacheEntry *e = &s_fcache_entries[s_fcache_entry_count++];
+    strncpy(e->path, path, sizeof(e->path) - 1);
+    e->path[sizeof(e->path) - 1] = '\0';
+    e->data = buf;
+    e->size = size;
+    s_fcache_total_bytes += size;
+    pthread_mutex_unlock(&s_fcache_lock);
+
+    l_debug("[fcache] cached %s (%ld bytes, %ld/%d bytes total in %d files)",
+            path, size, s_fcache_total_bytes, FCACHE_MAX_TOTAL_BYTES, s_fcache_entry_count);
+}
+
+static void normalize_path(const char *src, char *dst, size_t dst_size) {
+    if (!src || !dst || dst_size == 0) return;
+    size_t i = 0, j = 0;
+    const char *colon = strchr(src, ':');
+    if (colon && (size_t)(colon - src) < dst_size - 2) {
+        size_t prefix_len = (size_t)(colon - src) + 1;
+        memcpy(dst, src, prefix_len);
+        i += prefix_len;
+        j += prefix_len;
+    }
+    while (src[i] && j < dst_size - 1) {
+        if (src[i] == '/') {
+            dst[j++] = '/';
+            while (src[i] == '/') i++;
+            while (src[i] == '.' && src[i + 1] == '/') {
+                i += 2;
+                while (src[i] == '/') i++;
+            }
+        } else {
+            dst[j++] = src[i++];
+        }
+    }
+    dst[j] = '\0';
+}
+
 static bool storm_active_for(const char *filename) {
     return storm_count >= 20 && strcmp(filename, storm_path) == 0;
 }
 
 size_t fread_soloader(void *ptr, size_t size, size_t nmemb, FILE *stream) {
+    if (fcache_is_handle(stream)) {
+        if (size == 0 || nmemb == 0) return 0;
+        pthread_mutex_lock(&s_fcache_lock);
+        FCacheHandle *h = (FCacheHandle *) stream;
+        FCacheEntry *e = &s_fcache_entries[h->entry_idx];
+        long remaining = e->size - h->pos;
+        if (remaining < 0) remaining = 0;
+        size_t avail_items = ((size_t) remaining) / size;
+        size_t items = avail_items < nmemb ? avail_items : nmemb;
+        if (items > 0) {
+            memcpy(ptr, e->data + h->pos, items * size);
+            h->pos += (long) (items * size);
+        }
+        pthread_mutex_unlock(&s_fcache_lock);
+        return items;
+    }
     size_t n;
 #ifdef USE_SCELIBC_IO
     n = sceLibcBridge_fread(ptr, size, nmemb, stream);
@@ -356,18 +554,47 @@ size_t fread_soloader(void *ptr, size_t size, size_t nmemb, FILE *stream) {
 }
 
 FILE * fopen_soloader(const char * filename, const char * mode) {
+    if (!filename) return NULL;
     if (strcmp(filename, "/proc/cpuinfo") == 0) {
         return fopen_soloader("app0:/cpuinfo", mode);
     } else if (strcmp(filename, "/proc/meminfo") == 0) {
         return fopen_soloader("app0:/meminfo", mode);
     }
 
-    bool storm_internal = (strstr(filename, "/cache/") != NULL ||
-                           strstr(filename, "placeholder_atc.dds") != NULL);
+    char norm_buf[256];
+    normalize_path(filename, norm_buf, sizeof(norm_buf));
+    const char *path = norm_buf;
+
+    // Fast return if file is known not to exist (avoid repeating failed disk seeks)
+    if (mode && strchr(mode, 'r') && !strpbrk(mode, "wa+")) {
+        pthread_mutex_lock(&s_fcache_lock);
+        for (int i = 0; i < s_neg_cache_count; i++) {
+            if (strcmp(s_neg_cache[i], path) == 0) {
+                pthread_mutex_unlock(&s_fcache_lock);
+                return NULL;
+            }
+        }
+        pthread_mutex_unlock(&s_fcache_lock);
+    }
+
+    // Fast return if already cached in RAM (0ms file load)
+    if (fcache_is_cacheable_mode(mode)) {
+        pthread_mutex_lock(&s_fcache_lock);
+        int entry_idx = fcache_find_entry_locked(path);
+        FILE *cached = (entry_idx >= 0) ? fcache_open_handle_locked(entry_idx) : NULL;
+        pthread_mutex_unlock(&s_fcache_lock);
+        if (cached) {
+            l_debug("fopen(%s, %s): %p (fcache hit)", path, mode, cached);
+            return cached;
+        }
+    }
+
+    bool storm_internal = (strstr(path, "/cache/") != NULL ||
+                           strstr(path, "placeholder_atc.dds") != NULL);
     if (!storm_internal && mode) {
         uint64_t now = current_timestamp_ms();
-        if (storm_count == 0 || strcmp(filename, storm_path) != 0) {
-            snprintf(storm_path, sizeof(storm_path), "%s", filename);
+        if (storm_count == 0 || strcmp(path, storm_path) != 0) {
+            snprintf(storm_path, sizeof(storm_path), "%s", path);
             storm_count = 1;
             storm_start_ms = now;
         } else {
@@ -380,17 +607,21 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
                 (void)ra; (void)off;
                 l_warn("[fopen_storm] %s opened %u consecutive times in %llu ms "
                        "(caller .so offset 0x%x)",
-                       filename, storm_count, (unsigned long long)(now - storm_start_ms),
+                       path, storm_count, (unsigned long long)(now - storm_start_ms),
                        (unsigned)off);
             }
         }
     }
 
 #ifdef USE_SCELIBC_IO
-    FILE* ret = sceLibcBridge_fopen(filename, mode);
+    FILE* ret = sceLibcBridge_fopen(path, mode);
 #else
-    FILE* ret = fopen(filename, mode);
+    FILE* ret = fopen(path, mode);
 #endif
+
+    if (mode && strpbrk(mode, "wa+") != NULL) {
+        if (ret) fcache_invalidate(path);
+    }
 
     // Redirección ATC (transcodificar un .kot ATC a un DDS RGBA en cache/):
     // DESACTIVADA por defecto desde el rebase a v1.0.6.
@@ -418,11 +649,11 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
     // file the engine is creating -- a redirected "wb" would write the game's
     // output over our cache/placeholder instead of its real destination.
     if (atc_redirect_enabled &&
-        ret && mode && mode[0] == 'r' && strstr(filename, ".kot") != NULL &&
-        strstr(filename, "placeholder_atc.dds") == NULL &&
+        ret && mode && mode[0] == 'r' && strstr(path, ".kot") != NULL &&
+        strstr(path, "placeholder_atc.dds") == NULL &&
         looks_like_atc_dds(ret)) {
         char placeholder_buf[256];
-        const char *placeholder = get_decoded_atc_dds_path(filename, ret, placeholder_buf);
+        const char *placeholder = get_decoded_atc_dds_path(path, ret, placeholder_buf);
 #ifdef USE_SCELIBC_IO
         sceLibcBridge_fclose(ret);
 #else
@@ -438,13 +669,13 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
             (void)ra; (void)off; // l_warn compiles out in non-Debug builds
             l_warn("ATC-compressed DDS texture %s is not supported by the Vita GPU -- "
                    "redirecting to decoded cache %s (caller .so offset 0x%x)",
-                   filename, placeholder, (unsigned)off);
+                   path, placeholder, (unsigned)off);
         }
         ret = fopen_soloader(placeholder, mode);
-        l_debug("fopen(%s, %s): %p", filename, mode, ret);
+        l_debug("fopen(%s, %s): %p", path, mode, ret);
         // Track the FILE the game actually reads (the redirect target), keyed
         // to the outer storm path, so fread accounting below sees every byte.
-        if (ret && storm_active_for(filename))
+        if (ret && storm_active_for(path))
             storm_ring_add(ret);
         return ret;
     }
@@ -466,7 +697,7 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
     // screen plus the "invalid bind symbol" / "Unused parameter" spam seen in
     // log_20260909_224913.txt. Let it fail; do not reintroduce a shader
     // fallback without new evidence.
-    if (!ret && strncmp(filename, "app0:", 5) != 0) {
+    if (!ret && strncmp(path, "app0:", 5) != 0) {
         // Logo de Gameloft del Splash: el motor pide "gameloft_3x_tga" (variante
         // para pantallas grandes) pero el dataset v1.0.6 solo trae gameloft[_2x][_kr]
         // (Res.array confirma que no existe ningun gameloft_3x_*). Sin esto,
@@ -476,12 +707,12 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
         // asi que no hay recursion. Si el engine luego pide un .sprite hermano
         // y falla, cae al comportamiento actual (skip sin crash).
         if (!ret && mode && mode[0] == 'r') {
-            const char *slash = strrchr(filename, '/');
-            const char *base = slash ? slash + 1 : filename;
+            const char *slash = strrchr(path, '/');
+            const char *base = slash ? slash + 1 : path;
             if (strcmp(base, "gameloft_3x_tga") == 0) {
                 static const char logo_path[] =
                     DATA_PATH "GloftSOHP/data/2d/sprites/High_Quality/gameloft_2x.kot";
-                l_warn("Missing splash logo %s -- redirecting to %s", filename, logo_path);
+                l_warn("Missing splash logo %s -- redirecting to %s", path, logo_path);
                 ret = fopen_soloader(logo_path, mode);
             } else if (strcmp(base, "KnightsOdyssey_hand2_diffuse.tga") == 0) {
                 // La mano del personaje en mc.bdae referencia
@@ -497,9 +728,9 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
                 // (el target no se llama igual).
                 static const char hand_path[] =
                     DATA_PATH "GloftSOHP/data/3d/objects/MainCharacter/KnightsOdyssey_hand_diffuse.kot";
-                l_warn("Missing hand texture %s -- redirecting to %s", filename, hand_path);
+                l_warn("Missing hand texture %s -- redirecting to %s", path, hand_path);
                 ret = fopen_soloader(hand_path, mode);
-            } else if (strstr(filename, "data/3d/effects/") != NULL && strstr(base, ".glsl") != NULL) {
+            } else if (strstr(path, "data/3d/effects/") != NULL && strstr(base, ".glsl") != NULL) {
                 // Servir el shader embebido en el eboot (misma tabla que
                 // ensure_embedded_shaders_installed() instala al arranque).
                 // Es la red que atrapa el caso en que la instalacion inicial
@@ -508,15 +739,15 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
                 // pintaba de rosa en vez de mostrar loading_splash.kot.
                 size_t emb_len = 0;
                 const char *emb_src = get_embedded_shader(base, &emb_len);
-                if (emb_src && emb_len > 0 && strncmp(filename, "app0:", 5) != 0) {
-                    file_mkpath(filename, 0777);
-                    FILE *w = fopen(filename, "wb");
+                if (emb_src && emb_len > 0 && strncmp(path, "app0:", 5) != 0) {
+                    file_mkpath(path, 0777);
+                    FILE *w = fopen(path, "wb");
                     if (w) {
                         fwrite(emb_src, 1, emb_len, w);
                         fclose(w);
                         l_info("Installed on-demand embedded shader %s (%u bytes)",
-                               filename, (unsigned)emb_len);
-                        ret = fopen_soloader(filename, mode);
+                               path, (unsigned)emb_len);
+                        ret = fopen_soloader(path, mode);
                     }
                 }
                 // Ultimo recurso: shaders empaquetados en el .vpk (requiere
@@ -526,7 +757,7 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
                     snprintf(app0_shader, sizeof(app0_shader), "app0:/shaders/%s", base);
                     ret = fopen_soloader(app0_shader, mode);
                     if (ret) {
-                        l_info("Redirected missing shader %s -> %s", filename, app0_shader);
+                        l_info("Redirected missing shader %s -> %s", path, app0_shader);
                     }
                 }
             }
@@ -547,14 +778,34 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
         // NULL). Do not reintroduce this redirect without new evidence.
     }
 
-    if (ret)
-        l_debug("fopen(%s, %s): %p", filename, mode, ret);
-    else
-        l_warn("fopen(%s, %s): %p", filename, mode, ret);
+    if (ret) {
+        if (mode && !strpbrk(mode, "wa+")) {
+#ifdef USE_SCELIBC_IO
+            sceLibcBridge_setvbuf(ret, NULL, _IOFBF, 64 * 1024);
+#else
+            setvbuf(ret, NULL, _IOFBF, 64 * 1024);
+#endif
+            if (fcache_is_cacheable_mode(mode)) {
+                fcache_populate(path, ret);
+            }
+        }
+        l_debug("fopen(%s, %s): %p", path, mode, ret);
+    } else {
+        l_warn("fopen(%s, %s): %p", path, mode, ret);
+        if (mode && strchr(mode, 'r') && !strpbrk(mode, "wa+")) {
+            pthread_mutex_lock(&s_fcache_lock);
+            if (s_neg_cache_count < NEG_CACHE_SIZE) {
+                strncpy(s_neg_cache[s_neg_cache_count], path, 255);
+                s_neg_cache[s_neg_cache_count][255] = '\0';
+                s_neg_cache_count++;
+            }
+            pthread_mutex_unlock(&s_fcache_lock);
+        }
+    }
 
     // Non-redirected storm files (any future non-ATC .kot, or the path after
     // the redirect is disabled): track the game-visible FILE the same way.
-    if (ret && !storm_internal && storm_active_for(filename))
+    if (ret && !storm_internal && storm_active_for(path))
         storm_ring_add(ret);
 
     return ret;
@@ -567,6 +818,9 @@ int open_soloader(const char * path, int oflag, ...) {
         return open_soloader("app0:/meminfo", oflag);
     }
 
+    char norm_path[256];
+    normalize_path(path, norm_path, sizeof(norm_path));
+
     mode_t mode = 0666;
     if (((oflag & BIONIC_O_CREAT) == BIONIC_O_CREAT) ||
         ((oflag & BIONIC_O_TMPFILE) == BIONIC_O_TMPFILE)) {
@@ -576,12 +830,17 @@ int open_soloader(const char * path, int oflag, ...) {
         va_end(args);
     }
 
-    oflag = oflags_bionic_to_newlib(oflag);
-    int ret = open(path, oflag, mode);
+    int write_intent = (oflag & (BIONIC_O_WRONLY | BIONIC_O_RDWR | BIONIC_O_CREAT |
+                                 BIONIC_O_TRUNC | BIONIC_O_APPEND)) != 0;
+    int newlib_oflag = oflags_bionic_to_newlib(oflag);
+    int ret = open(norm_path, newlib_oflag, mode);
+    if (write_intent && ret >= 0) {
+        fcache_invalidate(norm_path);
+    }
     if (ret >= 0)
-        l_debug("open(%s, %x): %i", path, oflag, ret);
+        l_debug("open(%s, %x): %i", norm_path, newlib_oflag, ret);
     else
-        l_warn("open(%s, %x): %i", path, oflag, ret);
+        l_warn("open(%s, %x): %i", norm_path, newlib_oflag, ret);
     return ret;
 }
 
@@ -597,17 +856,27 @@ int fstat_soloader(int fd, stat64_bionic * buf) {
 }
 
 int stat_soloader(const char * path, stat64_bionic * buf) {
+    char norm_path[256];
+    normalize_path(path, norm_path, sizeof(norm_path));
+
     struct stat st;
-    int res = stat(path, &st);
+    int res = stat(norm_path, &st);
 
     if (res == 0)
         stat_newlib_to_bionic(&st, buf);
 
-    l_debug("stat(%s): %i", path, res);
+    l_debug("stat(%s): %i", norm_path, res);
     return res;
 }
 
 int fclose_soloader(FILE * f) {
+    if (fcache_is_handle(f)) {
+        pthread_mutex_lock(&s_fcache_lock);
+        ((FCacheHandle *) f)->entry_idx = -1;
+        pthread_mutex_unlock(&s_fcache_lock);
+        l_debug("fclose(%p): fcache handle released", f);
+        return 0;
+    }
     int i = storm_ring_find(f);
     if (i >= 0) {
         l_info("[fread_acct] storm file closed (%s): %u bytes in %u reads",
@@ -691,5 +960,231 @@ int ioctl_soloader(int fd, int request, ...) {
 int fsync_soloader(int fd) {
     int ret = fsync(fd);
     l_debug("fsync(%i): %i", fd, ret);
+    return ret;
+}
+
+size_t fwrite_soloader(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
+    if (fcache_is_handle(stream)) {
+        l_warn("fwrite(%p): refused on read-only cache handle", stream);
+        return 0;
+    }
+#ifdef USE_SCELIBC_IO
+    return sceLibcBridge_fwrite(ptr, size, nmemb, stream);
+#else
+    return fwrite(ptr, size, nmemb, stream);
+#endif
+}
+
+int fseek_soloader(FILE *stream, long offset, int whence) {
+    if (fcache_is_handle(stream)) {
+        pthread_mutex_lock(&s_fcache_lock);
+        FCacheHandle *h = (FCacheHandle *) stream;
+        FCacheEntry *e = &s_fcache_entries[h->entry_idx];
+        long base = (whence == SEEK_SET) ? 0 : (whence == SEEK_CUR) ? h->pos : e->size;
+        long newpos = base + offset;
+        int ok = (newpos >= 0);
+        if (ok) h->pos = newpos;
+        pthread_mutex_unlock(&s_fcache_lock);
+        return ok ? 0 : -1;
+    }
+#ifdef USE_SCELIBC_IO
+    return sceLibcBridge_fseek(stream, offset, whence);
+#else
+    return fseek(stream, offset, whence);
+#endif
+}
+
+long ftell_soloader(FILE *stream) {
+    if (fcache_is_handle(stream)) {
+        return ((FCacheHandle *) stream)->pos;
+    }
+#ifdef USE_SCELIBC_IO
+    return sceLibcBridge_ftell(stream);
+#else
+    return ftell(stream);
+#endif
+}
+
+int fseeko_soloader(FILE *stream, off_t offset, int whence) {
+    return fseek_soloader(stream, (long) offset, whence);
+}
+
+off_t ftello_soloader(FILE *stream) {
+    return (off_t) ftell_soloader(stream);
+}
+
+void rewind_soloader(FILE *stream) {
+    if (fcache_is_handle(stream)) {
+        pthread_mutex_lock(&s_fcache_lock);
+        ((FCacheHandle *) stream)->pos = 0;
+        pthread_mutex_unlock(&s_fcache_lock);
+        return;
+    }
+    rewind(stream);
+}
+
+int feof_soloader(FILE *stream) {
+    if (fcache_is_handle(stream)) {
+        pthread_mutex_lock(&s_fcache_lock);
+        FCacheHandle *h = (FCacheHandle *) stream;
+        int at_eof = (h->pos >= s_fcache_entries[h->entry_idx].size);
+        pthread_mutex_unlock(&s_fcache_lock);
+        return at_eof;
+    }
+#ifdef USE_SCELIBC_IO
+    return sceLibcBridge_feof(stream);
+#else
+    return feof(stream);
+#endif
+}
+
+int ferror_soloader(FILE *stream) {
+    if (fcache_is_handle(stream)) return 0;
+#ifdef USE_SCELIBC_IO
+    return sceLibcBridge_ferror(stream);
+#else
+    return ferror(stream);
+#endif
+}
+
+int fflush_soloader(FILE *stream) {
+    if (fcache_is_handle(stream)) return 0;
+#ifdef USE_SCELIBC_IO
+    return sceLibcBridge_fflush(stream);
+#else
+    return fflush(stream);
+#endif
+}
+
+int fgetc_soloader(FILE *stream) {
+    if (fcache_is_handle(stream)) {
+        unsigned char c;
+        return (fread_soloader(&c, 1, 1, stream) == 1) ? (int) c : EOF;
+    }
+#ifdef USE_SCELIBC_IO
+    return sceLibcBridge_fgetc(stream);
+#else
+    return fgetc(stream);
+#endif
+}
+
+int getc_soloader(FILE *stream) {
+    return fgetc_soloader(stream);
+}
+
+int fputc_soloader(int c, FILE *stream) {
+    if (fcache_is_handle(stream)) {
+        l_warn("fputc(%p): refused on read-only cache handle", stream);
+        return EOF;
+    }
+#ifdef USE_SCELIBC_IO
+    return sceLibcBridge_fputc(c, stream);
+#else
+    return fputc(c, stream);
+#endif
+}
+
+int putc_soloader(int c, FILE *stream) {
+    return fputc_soloader(c, stream);
+}
+
+char *fgets_soloader(char *s, int size, FILE *stream) {
+    if (fcache_is_handle(stream)) {
+        if (size <= 0) return NULL;
+        int i = 0;
+        for (; i < size - 1; i++) {
+            int c = fgetc_soloader(stream);
+            if (c == EOF) {
+                if (i == 0) return NULL;
+                break;
+            }
+            s[i] = (char) c;
+            if (c == '\n') { i++; break; }
+        }
+        s[i] = '\0';
+        return s;
+    }
+#ifdef USE_SCELIBC_IO
+    return sceLibcBridge_fgets(s, size, stream);
+#else
+    return fgets(s, size, stream);
+#endif
+}
+
+int fputs_soloader(const char *s, FILE *stream) {
+    if (fcache_is_handle(stream)) {
+        l_warn("fputs(%p): refused on read-only cache handle", stream);
+        return EOF;
+    }
+#ifdef USE_SCELIBC_IO
+    return sceLibcBridge_fputs(s, stream);
+#else
+    return fputs(s, stream);
+#endif
+}
+
+int fileno_soloader(FILE *stream) {
+    if (fcache_is_handle(stream)) {
+        return -1;
+    }
+#ifdef USE_SCELIBC_IO
+    return sceLibcBridge_fileno(stream);
+#else
+    return fileno(stream);
+#endif
+}
+
+int setvbuf_soloader(FILE *stream, char *buf, int mode, size_t size) {
+    if (fcache_is_handle(stream)) return 0;
+#ifdef USE_SCELIBC_IO
+    return sceLibcBridge_setvbuf(stream, buf, mode, size);
+#else
+    return setvbuf(stream, buf, mode, size);
+#endif
+}
+
+int ungetc_soloader(int c, FILE *stream) {
+    if (fcache_is_handle(stream)) {
+        pthread_mutex_lock(&s_fcache_lock);
+        FCacheHandle *h = (FCacheHandle *) stream;
+        int ok = (h->pos > 0);
+        if (ok) h->pos--;
+        pthread_mutex_unlock(&s_fcache_lock);
+        return ok ? c : EOF;
+    }
+#ifdef USE_SCELIBC_IO
+    return sceLibcBridge_ungetc(c, stream);
+#else
+    return ungetc(c, stream);
+#endif
+}
+
+ssize_t write_soloader(int fd, const void *buf, size_t count) {
+    return write(fd, buf, count);
+}
+
+int unlink_soloader(const char *path) {
+    char norm[256];
+    normalize_path(path, norm, sizeof(norm));
+    int ret = unlink(norm);
+    fcache_invalidate(norm);
+    return ret;
+}
+
+int remove_soloader(const char *path) {
+    char norm[256];
+    normalize_path(path, norm, sizeof(norm));
+    int ret = remove(norm);
+    fcache_invalidate(norm);
+    return ret;
+}
+
+int rename_soloader(const char *oldpath, const char *newpath) {
+    char norm_old[256], norm_new[256];
+    normalize_path(oldpath, norm_old, sizeof(norm_old));
+    normalize_path(newpath, norm_new, sizeof(norm_new));
+    int ret = rename(norm_old, norm_new);
+    fcache_invalidate(norm_old);
+    fcache_invalidate(norm_new);
     return ret;
 }

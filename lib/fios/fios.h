@@ -82,6 +82,7 @@ int sceFiosIOFilterAdd(int index, void *pFilterCallback, void *pFilterContext);
 void sceFiosIOFilterCache();
 
 int fios_init(const char * path);
+void fios_terminate(void);
 
 #ifdef __cplusplus
 };

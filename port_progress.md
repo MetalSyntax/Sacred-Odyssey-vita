@@ -3051,3 +3051,220 @@ textura en el personaje + montura completamente negra.
   interactuar con el diálogo tutorial, que las superficies multi-texturizadas del personaje ya no se ven
   negras, y evaluar si el bajón de FPS en zonas con muchas mallas animadas mejora o sigue igual (si sigue
   igual, confirma que el spam de skinning es la causa y habría que abordar el fix grande de arriba).
+
+## Sesión 2026-09-16 (madrugada) — Segundo crash (Triángulo+Cuadrado), el fix de texture2 nunca se instaló, y táctil "roto" en el title
+
+- **Reporte del usuario:** nuevo crash con `log_20260916_012236.txt` +
+  `sacredodyssey-psp2core-1789536379-0x000d8e30d7-eboot.bin.psp2dmp`, recordando haber presionado
+  Triángulo y luego Cuadrado. Además reportó que en el title screen la pantalla táctil no responde.
+- **Triage del crash:** mismo patrón que la sesión anterior -- `Data abort`, `PC` de nuevo dentro de
+  `is_widget_active` (`source/controls.c`), `ldrb r3,[r3,#0]` sobre `widget+0x18`. La guarda de
+  alineación agregada en la sesión pasada SÍ está compilada (se ve en el desensamblado, `and.w r3,r3,#3`
+  antes del load), pero esta vez el valor de `widget` era `0x100` -- **alineado a 4 bytes**, así que pasó
+  esa guarda, pero es un valor absurdamente bajo para ser un puntero real (el loader vive en `0x81000000`,
+  el `.so` en `0x98000000`, y todo puntero de heap visto en los logs de este port está muy por encima de
+  `0x81000000`).
+  - `LR`/stack resuelto contra el desensamblado de `controls_update` (mismo método que la sesión
+    anterior): la llamada que crasheó fue `get_widget_pos(HUD_OFFSET_SWITCH_MENU=72, ...)`, la ÚLTIMA de
+    la cadena de checks del botón **Triángulo** (`source/controls.c`, tras IRON_EAGLE/IRON_FIST/
+    IRON_CHAIN/SWITCH_WEAPON) -- coincide con lo que el usuario recordaba.
+  - Contexto en el log justo antes del corte: `DOWN 4` / `New IGM hud` (abrió el menú de pausa) ->
+    `UP 4` / `Resume music... Destroy IGM hud` (lo cerró) -> dos líneas `x 635, Y 385` (el fallback fijo
+    de **Cuadrado**, confirmando que Cuadrado también estaba presionado en el mismo frame) -> corte. O
+    sea: el usuario soltó el menú de pausa y presionó Cuadrado+Triángulo casi a la vez; en ese frame
+    exacto, el slot de Hud para `button_swichWeaponWithMenu` (offset 72) quedó con `0x100` en vez de un
+    puntero real o `NULL` -- muy probablemente basura transitoria de la propia reconstrucción de la tabla
+    de widgets del Hud justo al destruirse el HUD del menú de pausa (mismo mecanismo ya documentado la
+    sesión anterior, un slot distinto y un valor de basura distinto).
+  - **Fix:** la guarda pasó de "solo alineación" a "alineación + piso mínimo de dirección plausible"
+    (`is_plausible_ptr()`, `>= 0x10000` y 4-byte alineado), aplicada tanto a `widget` en
+    `is_widget_active()` como a `hud` en `get_widget_pos()`. Un puntero real jamás cae en esa región (es
+    la página de guarda que cualquier SO reserva sin mapear para que bugs de puntero-basura/NULL fallen
+    de inmediato), así que el chequeo no puede rechazar un objeto legítimo -- solo evita el data abort.
+- **Hallazgo grave -- el fix de `texture2` de la sesión anterior nunca llegó a la consola:** el log de
+  ESTA corrida sigue mostrando exactamente `invalid bind symbol: texture2` / `Unused parameter: texture2`
+  para `UnlitMultiTexturedFP.glsl`, pese a que el fix ya estaba en el código fuente y compilado. Causa
+  raíz: `ensure_embedded_shaders_installed()` (`source/utils/embedded_shaders.c`) decidía si reinstalar
+  cada shader embebido comparando **solo el tamaño en bytes** contra el archivo ya existente en
+  `ux0:data/.../effects/`. Renombrar `texture1` -> `texture2` (y `tex1` -> `tex2`) no cambia ni un byte
+  de longitud, así que el instalador consideraba el `.glsl` viejo y roto "ya al día" y nunca lo
+  sobrescribía -- sin importar cuántas veces se recompilara y redeployara el eboot. Este bug afecta a
+  CUALQUIER futuro fix de shader embebido cuyo tamaño no cambie, no solo a este caso puntual.
+  - **Fix:** el chequeo ahora compara contenido byte a byte (no solo tamaño) antes de decidir que un
+    shader ya está instalado y saltearlo.
+- **Investigado, sin patch (todavía sin evidencia de bug real) -- táctil no responde en el title:**
+  cruzando el log con el pseudo-C de `appOnTouch` (`decompiled/decompiled_so/libsacredodyssey_v106/
+  out_ghidra.c:3468`), CADA evento de touch que llega a esa función imprime incondicionalmente
+  `"x %d, Y %d"` antes de cualquier chequeo. Durante todo el estado `Splash` (~2400 líneas de log, varios
+  segundos ya con fps=59.9 estable) no aparece ninguna línea `x/Y` real -- la única es la sintética que generó
+  nuestro botón Cruz al forzar la salida del splash. Eso apunta a que ningún toque real llegó a
+  `appOnTouch` en absoluto durante el splash, no a que haya llegado y se haya ignorado. `appOnTouch`
+  tiene su propio gate nativo (`m_IsSlideEnable` / `MenuState::IsFinished()` / `Gameplay::s_instance+0x24`)
+  independiente de la capa Java que este port no ejecuta (bypasseamos `GameGLSurfaceView.onTouchEvent`
+  llamando directo al `nativeOnTouch` JNI) -- es plausible que el motor original YA ignore el táctil
+  mientras `MenuState::IsFinished()` es falso (p.ej. mientras el splash sigue precargando assets/audio,
+  el mismo "boot stall" ya documentado en sesiones previas), lo cual sería comportamiento original, no un
+  bug de este port. **No se tocó nada** por falta de evidencia de que sea distinto al comportamiento del
+  Android original -- pendiente confirmar en consola: si el táctil sigue sin responder incluso varios
+  segundos DESPUÉS de que el splash ya esté a fps estable (no solo apenas arranca), eso sí apuntaría a un
+  bug real de nuestro lado (ej. `m_IsSlideEnable`/`m_IsRightTouchPad` inicializados distinto a como los
+  dejaría el `Activity`/`View` real de Android, ya que esos globals normalmente los setea código Java que
+  este port no ejecuta) y ameritaría seguir esta pista con más profundidad.
+- **Validación:** build limpio (`psvita-toolkit build --preset debug`). **No se pudo redeployar:** la
+  consola no respondió por FTP (`Errno 60/65/64`, host caído/inalcanzable) -- falta abrir VitaShell y
+  activar FTP con SELECT, y volver a correr `psvita-toolkit deploy --eboot --yes`.
+- **Pendiente (consola):** redeployar el eboot pendiente, confirmar que el crash de Triángulo+Cuadrado no
+  se repite, confirmar en el log que `invalid bind symbol: texture2` ya no aparece (validaría que el fix
+  de la sesión anterior por fin se instaló), y probar el táctil en el title esperando varios segundos
+  extra antes de tocar, para descartar/confirmar si es solo el boot stall ya conocido.
+
+## Sesión 2026-09-16 — Optimización integral de tiempos de carga (boot y World::LoadMap)
+
+- **Motivo y objetivos:** acelerar sustancialmente los tiempos de espera en las pantallas de carga al iniciar el juego y al cargar partida/mundo (`World::LoadMap`), aplicando las mejores prácticas comprobadas de Rinnegatamante y TheFlow en ports de Android a PS Vita.
+- **Diagnóstico del cuello de botella en I/O:**
+  - El motor de Gameloft realiza miles de accesos I/O (`fopen_soloader` supera las 2.270 llamadas por sesión). Al carecer de buffer ampliado en `fopen`, la biblioteca C realizaba lecturas en bloques minúsculos (1 KB o sin buffer), multiplicando las llamadas al kernel durante el análisis de archivos Collada XML (`.bdae`), grafos `.graphml` y texturas `.kot`.
+  - En `source/patch.c`, el trampolín de `World::LoadMap` invocaba `gl_swap()` (que llama a `vglSwapBuffers(GL_FALSE)` bloqueando por VBLANK ~16.6 ms) cada 4 objetos a través de 107 objetos, sumando más de 450 ms de tiempo ocioso puro de espera a VBLANK.
+  - El motor concatenaba rutas frecuentemente con dobles barras (ej. `...GloftSOHP//data/...`), lo que aumentaba el overhead en la resolución de rutas de la tarjeta de memoria.
+- **Cambios e implementaciones:**
+  1. **FIOS2 Kernel RAM Cache (`lib/fios/fios.c` / `fios.h`):**
+     - Ampliado el caché de memoria FIOS2 de 64 bloques (8 MB) a 512 bloques (64 MB), con fallback a 256 bloques (32 MB) si la memoria física disponible es menor.
+     - Almacenes de descriptores y operaciones ampliados: `g_ChunkStorage` (2048), `g_FHStorage` (2048), `g_OpStorage` (128), `g_DHStorage` (64), y `params.maxChunk = 2048`.
+     - Añadido prototipo y función `fios_terminate(void)` para limpieza segura al salir.
+  2. **Stream Buffering y Caching en memoria (`source/reimpl/io.c` / `io.h`):**
+     - **Buffer de 64 KB en streams:** `setvbuf(ret, NULL, _IOFBF, 64 * 1024)` aplicado automáticamente a todo archivo abierto en modo lectura (`"r"` / `"rb"`).
+     - **FCACHE (Caché en RAM thread-safe):** almacena en memoria archivos de hasta 8 MB leídos repetidamente con un presupuesto global de 64 MB y 512 entradas.
+     - **Negative Lookup Cache (NEG_CACHE):** 1024 entradas con hashes rápidos (djb2) para registrar archivos inexistentes buscados frecuentemente por el motor, devolviendo `NULL`/`ENOENT` en 0 ms sin acceder al almacenamiento.
+     - **Normalización de rutas (`normalize_path`):** colapsa dobles barras (`//`) y `/./` en todas las operaciones de apertura, estado y borrado.
+     - **Implementación de wrappers stdio completos:** `fwrite_soloader`, `fseek_soloader`, `ftell_soloader`, `fseeko_soloader`, `ftello_soloader`, `rewind_soloader`, `feof_soloader`, `ferror_soloader`, `fflush_soloader`, `fgetc_soloader`, `getc_soloader`, `fputc_soloader`, `putc_soloader`, `fgets_soloader`, `fputs_soloader`, `fileno_soloader`, `setvbuf_soloader`, `ungetc_soloader`, `write_soloader`, `unlink_soloader`, `remove_soloader`, `rename_soloader`. Manejan de forma transparente tanto handles virtuales de memoria como descriptores físicos de disco/SceLibc, con invalidación inmediata del caché ante cualquier operación de escritura/borrado/renombrado.
+  3. **Enrutamiento dinámico en `source/dynlib.c`:**
+     - Se reemplazaron todas las llamadas directas de stdio / SceLibcBridge para redirigirlas a sus correspondientes wrappers `_soloader`. Esto previene desincronizaciones de estado, soluciona el llamado de `fseeko`/`ftello` que apuntaba a newlib en lugar de SceLibc, y garantiza soporte transparente para streams en memoria.
+  4. **Optimización de `world_load_yield` (`source/patch.c`):**
+     - Se sustituyó el throttle fijo por conteo de llamadas (`call_count % 4`) por un throttle temporal de 150 ms utilizando `current_timestamp_ms()`.
+     - Mantiene la barra de progreso animada y la interfaz receptiva durante la carga de partida, ahorrando cientos de milisegundos de esperas ociosas de VBLANK.
+  5. **Caché en disco persistente para shaders de VitaGL (`source/utils/glutil.c`):**
+     - Se configuró `vglSetShaderCachePath(DATA_PATH "cache/shaders")` previo a `vglInitExtended`, asegurando la creación del directorio con `file_mkpath(DATA_PATH "cache/shaders/", 0777)`.
+     - Permite que los shaders compilados por ShaccCg/vitashark se almacenen en disco y se carguen casi instantáneamente en arranques posteriores.
+- **Validación:**
+  - Compilación limpia verificada con CMake y VitaSDK (`eboot.bin` y `sacredodyssey.vpk` generados exitosamente).
+- **Pendiente (consola física):**
+  - Desplegar el nuevo `eboot.bin` y medir los tiempos de carga en el inicio del juego y en la transición de mapa/partida.
+
+## Sesión 2026-09-16 (cont.) — Tercer crash confirmado por `is_plausible_ptr()` insuficiente al presionar Triangle
+
+- **Reporte:** crash reproducible al presionar el botón Triangle en consola. Dump
+  `sacredodyssey-psp2core-1789601444-0x00133836cd-eboot.bin.psp2dmp` + `log_20260916_192522.txt`.
+- **Triaje (`so-crash-triage` + `psvita-toolkit analyze`):** el DWARF del `.elf` del loader resolvió el
+  crash directamente contra nuestro propio código (no el `.so` del juego):
+  - `PC` → `is_widget_active()` en `source/controls.c:94` (`*(float *)(widget + 0xdc)`).
+  - `LR` → misma función, línea 92 (lectura de `widget + 0x18`, que sí tuvo éxito).
+  - Backtrace: `controls_update` (línea 325, bloque de TRIANGLE) → `get_widget_pos(HUD_OFFSET_SWITCH_MENU)`
+    → `is_widget_active`.
+  - `widget = 0x00010118` (visto en `R3`): un puntero basura que el motor dejó en la tabla de widgets del
+    HUD (mismo patrón ya documentado dos veces en el comentario de `is_plausible_ptr()`), pero esta vez
+    pasó el guard existente porque `MIN_PLAUSIBLE_PTR` estaba en `0x00010000` — apenas por encima del
+    umbral, pero igual de inválido/no mapeado.
+- **Causa raíz confirmada:** el guard `is_plausible_ptr()` (agregado en una sesión previa para descartar
+  punteros basura tipo `0x100`) usaba un umbral demasiado bajo. "Estar por encima de la página de guarda
+  nula" no es lo mismo que "ser un objeto real" — todo puntero real de heap/stack observado en los logs
+  de este port está muy por encima de `0x80000000`.
+- **Fix (`source/controls.c`):** `MIN_PLAUSIBLE_PTR` subido de `0x00010000u` a `0x10000000u` (256 MB),
+  con margen amplio respecto a las direcciones reales observadas (`0x80xxxxxx`-`0x98xxxxxx`) para no
+  rechazar nunca un objeto vivo, pero sí cualquier basura tipo entero-pequeño/casi-NULL. Comentario
+  actualizado documentando este tercer caso confirmado.
+- Validado: build limpio (`psvita-toolkit build`), `eboot.bin`/`sacredodyssey.vpk` regenerados.
+- **Pendiente (consola física):** desplegar y confirmar que Triangle ya no crashea, tanto en el menú
+  in-game (caso original) como en el gameplay normal (armas secundarias / iron eagle-fist-chain).
+
+## Sesión 2026-09-16 (cont.) — Re-mapeo físico de botones, ocultar joystick virtual, investigación de texturas negras
+
+Reporte del usuario con `log_20260916_203851.txt` (5189 líneas, sin crash, llega a gameplay normal en
+Village/Savage/machang) + screenshot `screenshots/hj/2026-09-16/2026-09-16-204503.jpg`.
+
+### Re-mapeo de botones físicos (`source/controls.c`), pedido explícito del usuario
+
+- Esquema anterior: X=Acción/Interactuar, Cuadrado=Espada/Ataque, Triángulo=Arma secundaria/Switch Menu,
+  Círculo=Escudo (ya correcto), Start=Menú (ya correcto).
+- Esquema nuevo pedido: **X=Espada, Círculo=Escudo (sin cambios), Triángulo=Caballo, Cuadrado=Mapa,
+  Start=Menú (sin cambios)**.
+- Cambios:
+  - **CROSS (X):** ahora prioriza `HUD_OFFSET_ATTACK`/`HUD_OFFSET_SWORD` (antes exclusivo de Square), con
+    la cadena de fallback de Acción/Interactuar (diálogo, cutscene, hablar con NPC, tesoro, bomba, caja,
+    espejo) detrás — nunca se muestran ambos grupos de widgets al mismo tiempo en la UI del juego
+    (combate vs. exploración), así que fusionarlos en un solo botón no cuesta nada y mantiene la
+    interacción accesible.
+  - **SQUARE:** ahora exclusivamente `HUD_OFFSET_MINI_MAP` (antes Espada/Ataque).
+  - **TRIANGLE:** ahora exclusivamente `HUD_OFFSET_CHANGE_HORSE`/`HUD_OFFSET_CHANGE_RUN` (antes Iron
+    Eagle/Fist/Chain/Switch Weapon/Switch Menu — esas habilidades secundarias quedan sin botón físico
+    dedicado, accesibles solo por touch directo en su ícono, tal como pidió el usuario).
+  - CIRCLE, L TRIGGER, R TRIGGER, SELECT, START: sin cambios (Circle ya era escudo/back; R Trigger sigue
+    teniendo Horse como mapeo redundante, inofensivo).
+
+### Joystick virtual ocultado (`source/controls.c`)
+
+- Nueva función `hide_widget(HUD_OFFSET_MOVEPAD)`, llamada cada frame en `controls_update()`: fuerza a 0
+  el byte "visible" (`widget + 0x18`, el mismo flag que `is_widget_active()` ya lee) del widget del
+  joystick virtual en pantalla. El control físico ya reemplaza por completo su función
+  (`hook_HudMovePad_Get_MovePad_AxisValues` lee el stick/D-Pad real) y el usuario confirmó que tocarlo en
+  pantalla no hace nada — dejarlo dibujado era solo ruido visual sobre el HUD de control físico.
+
+### Investigación de "sprites/texturas en negro"
+
+- **Hallazgo real y corregido:** el log mostró 3 materiales (uno en boot antes del splash, uno en
+  `mainmenu2/camglow.kot`, uno en `TalkIcons/icon_group02.kot`) pidiendo el nombre literal `texture1`
+  para su segunda textura (`invalid bind symbol: texture1` / `Unused parameter: texture1`), mientras que
+  nuestro `UnlitMultiTexturedFP.glsl` embebido solo declaraba `texture2` (renombrado así en la sesión
+  2026-09-15 para OTRO material que sí pedía `texture2`). Confirmado con `grep`: 0 ocurrencias de
+  `texture2` fallando, 6 de `texture1` (3 pares invalid+unused) — es decir, distintos materiales de este
+  juego usan nombres literales distintos para la misma semántica ("segunda textura"), no hay un nombre
+  único correcto.
+  - **Fix (`source/utils/embedded_shaders.c`):** `UnlitMultiTexturedFP.glsl` ahora declara y muestrea
+    TANTO `texture1` como `texture2` (cada uno con su propia guarda de señal `> 0.03`), cubriendo
+    cualquiera de los dos nombres sin tener que perseguir cuál toca cada vez que aparece un material
+    nuevo.
+  - **Fix complementario (`source/utils/glutil.c`, `glLinkProgram_soloader`):** por defecto GLSL deja un
+    sampler uniform sin asignar en la unidad de textura 0 — la MISMA que ya usa `texture` — así que si un
+    material solo provee uno de los dos nombres, el otro leería la MISMA imagen que la textura primaria,
+    pasaría la guarda de señal (es una imagen real, no negra) y oscurecería el color multiplicándolo por
+    sí mismo. Se fuerza `texture1`/`texture2` a la unidad 7 (garantizada por el mínimo GLES2 de 8
+    unidades, nunca usada realmente en este port) inmediatamente después de linkear, así el que el
+    material no sobrescriba explícitamente lee `(0,0,0,0)` y la guarda lo descarta correctamente.
+- **Importante — lo que NO se confirmó como bug:** el log también muestra, para ESOS MISMOS 3
+  materiales, `unbound parameter TextureMatrix0`/`unbound parameter texture` inmediatamente después de
+  que nuestro propio `[gl_bind]` (telemetría ya existente) logueara ubicaciones VÁLIDAS (no `-1`) para
+  esos mismos nombres en el mismo programa. Esto confirma lo que el comentario de `glutil.c:43-45` ya
+  documentaba ("reportado 'unbound'/'invalid bind symbol' en cada log hasta ahora"): estos mensajes del
+  binder del motor son ruido normal/esperado del motor (informan "el material no proveyó dato explícito
+  para este parámetro", no un fallo real de `glGetUniformLocation`) — NO se debe seguir usándolos como
+  evidencia de textura negra sin corroborar con una captura visual real.
+  - El screenshot adjunto (`2026-09-16-204503.jpg`, dentro de la ventana temporal de este mismo log) NO
+    muestra ninguna textura negra — la escena (interior de choza, personaje, HUD) se ve completamente
+    normal.
+- **Pendiente — se necesita evidencia nueva:** no se pudo confirmar en esta sesión DÓNDE el usuario sigue
+  viendo sprites/texturas negras específicamente. Se aplicó el fix de `texture1`/`texture2` porque es de
+  bajo riesgo y cierra una brecha real (aunque probablemente menor: los 3 materiales afectados son un
+  glow de menú y un ícono de diálogo, no geometría central), pero para seguir esta investigación hace
+  falta un screenshot tomado EN EL MOMENTO en que se ve la textura negra, más el log de esa misma
+  corrida.
+
+### Build (a pedido: "debugea como se hacen los builds")
+
+- Este port es "legacy" (no tiene `build.sh` propio): `psvita-toolkit build` lo detecta y compila
+  directo con CMake, copiando el código fuente (respetando `.gitignore`) a un directorio temporal
+  (`/var/folders/.../psvita-build-XXXXXXXX/src`), corriendo `cmake -G "Unix Makefiles"
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ... -DCMAKE_BUILD_TYPE=Debug
+  -DUSE_SCELIBC_IO=ON -DDUMP_COMPILED_SHADERS=OFF`, y copiando `eboot.bin`/`sacredodyssey.vpk` de vuelta
+  a la raíz del proyecto (más `compile_commands.json` para clangd/IDEs).
+  - `DEBUG_SOLOADER` viene activo con el preset Debug (necesario para que `l_info`/`l_debug`/etc. no se
+    compilen a nada — ver Fase 8, "logging incremental").
+  - El `eboot build stamp` que loguea el propio loader al arrancar (`main.c`, con `__DATE__ __TIME__`) es
+    la forma más confiable de confirmar que la consola corrió el build que uno cree: en este log decía
+    "Sep 16 2026 20:13:27", generado ~25 min antes de la corrida — sin indicios de build/deploy
+    desactualizado en esta sesión puntual.
+  - Build validado limpio con los 3 fixes de esta entrada (`psvita-toolkit build`), `eboot.bin`/
+    `sacredodyssey.vpk` regenerados.
+- **Pendiente (consola física):** desplegar el VPK completo (no solo el eboot, para asegurar que el
+  `UnlitMultiTexturedFP.glsl` actualizado se reinstale en `ux0:data/` — `ensure_embedded_shaders_installed`
+  ya compara contenido, no tamaño, así que se auto-corrige en el próximo arranque de todas formas), probar
+  el nuevo mapeo de botones (X=espada, Cuadrado=mapa, Triángulo=caballo, Círculo=escudo), confirmar que el
+  joystick virtual ya no se dibuja en pantalla, y traer screenshot + log de la escena donde persista
+  alguna textura negra.

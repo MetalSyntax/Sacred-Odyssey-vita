@@ -13,12 +13,13 @@
 
 #define MAX_PATH_LENGTH 256
 #define RAMCACHEBLOCKSIZE (128 * 1024)
-#define RAMCACHEBLOCKNUM 64
+#define RAMCACHEBLOCKNUM 512
+#define RAMCACHEBLOCKNUM_FALLBACK 256
 
-static int64_t g_OpStorage[SCE_FIOS_OP_STORAGE_SIZE(64, MAX_PATH_LENGTH) / sizeof(int64_t) + 1];
-static int64_t g_ChunkStorage[SCE_FIOS_CHUNK_STORAGE_SIZE(1024) / sizeof(int64_t) + 1];
-static int64_t g_FHStorage[SCE_FIOS_FH_STORAGE_SIZE(1024, MAX_PATH_LENGTH) / sizeof(int64_t) + 1];
-static int64_t g_DHStorage[SCE_FIOS_DH_STORAGE_SIZE(32, MAX_PATH_LENGTH) / sizeof(int64_t) + 1];
+static int64_t g_OpStorage[SCE_FIOS_OP_STORAGE_SIZE(128, MAX_PATH_LENGTH) / sizeof(int64_t) + 1];
+static int64_t g_ChunkStorage[SCE_FIOS_CHUNK_STORAGE_SIZE(2048) / sizeof(int64_t) + 1];
+static int64_t g_FHStorage[SCE_FIOS_FH_STORAGE_SIZE(2048, MAX_PATH_LENGTH) / sizeof(int64_t) + 1];
+static int64_t g_DHStorage[SCE_FIOS_DH_STORAGE_SIZE(64, MAX_PATH_LENGTH) / sizeof(int64_t) + 1];
 
 static SceFiosRamCacheContext g_RamCacheContext = SCE_FIOS_RAM_CACHE_CONTEXT_INITIALIZER;
 static char *g_RamCacheWorkBuffer;
@@ -36,6 +37,7 @@ int fios_init(const char * path) {
     params.dhStorage.pPtr = g_DHStorage;
     params.dhStorage.length = sizeof(g_DHStorage);
     params.pathMax = MAX_PATH_LENGTH;
+    params.maxChunk = 2048;
 
     params.threadAffinity[SCE_FIOS_IO_THREAD] = 0x20000;
     params.threadAffinity[SCE_FIOS_CALLBACK_THREAD] = 0;
@@ -49,13 +51,18 @@ int fios_init(const char * path) {
     if (res < 0)
         return res;
 
-    g_RamCacheWorkBuffer = memalign(8, RAMCACHEBLOCKNUM * RAMCACHEBLOCKSIZE);
+    size_t block_num = RAMCACHEBLOCKNUM;
+    g_RamCacheWorkBuffer = memalign(8, block_num * RAMCACHEBLOCKSIZE);
+    if (!g_RamCacheWorkBuffer) {
+        block_num = RAMCACHEBLOCKNUM_FALLBACK;
+        g_RamCacheWorkBuffer = memalign(8, block_num * RAMCACHEBLOCKSIZE);
+    }
     if (!g_RamCacheWorkBuffer)
         return -1;
 
     g_RamCacheContext.pPath = path;
     g_RamCacheContext.pWorkBuffer = g_RamCacheWorkBuffer;
-    g_RamCacheContext.workBufferSize = RAMCACHEBLOCKNUM * RAMCACHEBLOCKSIZE;
+    g_RamCacheContext.workBufferSize = block_num * RAMCACHEBLOCKSIZE;
     g_RamCacheContext.blockSize = RAMCACHEBLOCKSIZE;
     res = sceFiosIOFilterAdd(0, sceFiosIOFilterCache, &g_RamCacheContext);
     if (res < 0)

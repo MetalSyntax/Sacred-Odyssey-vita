@@ -3,6 +3,7 @@
 #include "utils/utils.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -161,24 +162,37 @@ static const char s_UnlitTexturedBlendTextureAlphaFP[] =
 static const char s_UnlitMultiTexturedFP[] =
     "precision mediump float;\n"
     "uniform sampler2D texture;\n"
+    "uniform sampler2D texture1;\n"
     "uniform sampler2D texture2;\n"
     "varying mediump vec2 vTexCoord0;\n"
     "varying lowp vec4 vColor0;\n"
     "\n"
     "void main(void)\n"
     "{\n"
-    // Sesion 2026-09-15: el intento anterior nombro esta uniform "texture1",
-    // pero el binder del motor (os::Printer::log "invalid bind symbol"/
-    // "Unused parameter") pide literalmente "texture2" -- confirmado en el
-    // log de esta corrida ("invalid bind symbol: texture2", "unbound
-    // parameter texture" para UnlitOneTextureAndVertexColorVP.glsl
-    // UnlitMultiTexturedFP.glsl). Con el nombre equivocado la uniform seguia
-    // sin bindearse nunca, dejando el personaje sin su segunda textura en las
-    // superficies multi-texturizadas (reportado como "texturas parcialmente
-    // negras"). Guarda de senal igual que en ProfileCOMMON MULTITEXTURED: una
-    // unidad sin textura completa devuelve (0,0,0,1) y multiplicar a ciegas
-    // ennegreceria el sprite.
+    // Sesion 2026-09-15: esta uniform se llamaba solo "texture1", pero el
+    // binder de ESE material pedia literalmente "texture2" -> se renombro.
+    // Sesion 2026-09-16: log_20260916_203851.txt volvio a mostrar "invalid
+    // bind symbol: texture1"/"Unused parameter: texture1" (3 materiales
+    // distintos: mainmenu2/camglow, TalkIcons/icon_group02, y uno mas
+    // temprano en boot) -- es decir, DISTINTOS materiales piden distintos
+    // nombres literales para su segunda textura segun como se autoro el
+    // efecto original ("texture1" vs "texture2"), no hay un nombre unico
+    // correcto. Declarar ambos cubre a cualquiera de los dos sin repetir
+    // esta persecucion de nombre cada vez que aparece un material nuevo.
+    // Guarda de senal igual que en ProfileCOMMON MULTITEXTURED: una unidad
+    // sin textura completa devuelve (0,0,0,1) y multiplicar a ciegas
+    // ennegreceria el sprite. glLinkProgram_soloader (glutil.c) fuerza el
+    // valor por defecto de texture1/texture2 a una unidad de textura vacia
+    // (no la 0, que ya usa "texture") para que el que NO reciba dato real del
+    // material lea (0,0,0,0) -- sin esto, ambos por defecto en la unidad 0
+    // leerian la MISMA imagen que "texture" y la guarda de senal los dejaria
+    // pasar igual, multiplicando el color por si mismo (oscurecimiento
+    // incorrecto en vez de simplemente no aplicar segunda textura).
     "    vec4 color = texture2D(texture, vTexCoord0);\n"
+    "    vec4 tex1 = texture2D(texture1, vTexCoord0);\n"
+    "    if ((tex1.r + tex1.g + tex1.b) > 0.03) {\n"
+    "        color *= tex1;\n"
+    "    }\n"
     "    vec4 tex2 = texture2D(texture2, vTexCoord0);\n"
     "    if ((tex2.r + tex2.g + tex2.b) > 0.03) {\n"
     "        color *= tex2;\n"
@@ -278,14 +292,30 @@ void ensure_embedded_shaders_installed(void) {
         size_t src_len = strlen(s_embedded_shaders[i].source);
         int need_write = 1;
 
+        // Comparar CONTENIDO, no solo tamano. Un fix de shader que solo
+        // renombra una uniform (ej. "texture1" -> "texture2", sesion
+        // 2026-09-15) no cambia src_len un solo byte: el chequeo anterior
+        // (solo tamano) lo consideraba "ya instalado" y dejaba el .glsl
+        // viejo/roto en ux0:data para siempre, sin importar cuantas veces se
+        // recompilara y redeployara el eboot -- confirmado en consola: el log
+        // de la sesion siguiente seguia mostrando exactamente el mismo
+        // "invalid bind symbol: texture2" que el fix debia eliminar.
         FILE *chk = fopen(dst_path, "rb");
         if (chk) {
             fseek(chk, 0, SEEK_END);
             long sz = ftell(chk);
-            fclose(chk);
             if (sz == (long)src_len) {
-                need_write = 0;
+                fseek(chk, 0, SEEK_SET);
+                char *buf = (char *)malloc(src_len);
+                if (buf) {
+                    size_t read_n = fread(buf, 1, src_len, chk);
+                    if (read_n == src_len && memcmp(buf, s_embedded_shaders[i].source, src_len) == 0) {
+                        need_write = 0;
+                    }
+                    free(buf);
+                }
             }
+            fclose(chk);
         }
 
         if (need_write) {
