@@ -3,6 +3,7 @@
 #include "utils/logger.h"
 #include "utils/dialog.h"
 #include "controls.h"
+#include "audio.h"
 
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/kernel/processmgr.h>
@@ -135,6 +136,9 @@ int main(void) {
     gl_init();
     l_info("vitaGL initialized successfully.");
 
+    l_info("Initializing audio (sceAudioOut, AudioTrack shim)...");
+    audio_init();
+
     // Sequence corresponding to Game.onCreate & GameRenderer.onDrawFrame (first frame)
     l_info("Initializing Device...");
     nativeDeviceInit(&jni, NULL);
@@ -225,6 +229,8 @@ int main(void) {
     if (nativeGameRendererDone) {
         nativeGameRendererDone(&jni, NULL);
     }
+
+    audio_shutdown();
 
     sceKernelExitDeleteThread(0);
     return 0;

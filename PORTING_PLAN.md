@@ -97,7 +97,10 @@ El análisis estático de símbolos y constantes confirma sin ambigüedad que Sa
 - [ ] **Fase 8:** Primer arranque en Vita3K / hardware real con captura de logs.
 - [ ] **Fase 9:** Depuración gráfica (shaders GLSL en VitaGL, texturas PVRTC/TGA, buffers).
 - [ ] **Fase 10:** Mapeo de controles táctiles / analógicos a los botones físicos de la Vita.
-- [ ] **Fase 11:** Implementación de audio nativo (bridge sceAudioOut para GLMediaPlayer/Vox).
+- [x] **Fase 11:** Implementación de audio nativo (bridge `android/media/AudioTrack` -> `sceAudioOut`
+  para el middleware VOX del motor, confirmado como el único sink de audio real usado por
+  `vox::DriverAndroid::DoCallbackAT` -- `source/audio.c`/`.h`, wireado en `source/java.c`; ver
+  port_progress.md, sesión 2026-09-17). Pendiente de confirmación final en consola física.
 - [ ] **Fase 12:** Empaquetado final y verificación en consola física.
 
 ---

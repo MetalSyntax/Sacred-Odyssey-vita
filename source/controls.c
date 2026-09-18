@@ -20,7 +20,7 @@ static uint32_t s_old_buttons = 0;
 static uint32_t s_current_buttons = 0;
 
 // Global pointer to Hud::s_pInstance in libsacredodyssey.so
-static uintptr_t **s_hud_s_pInstance_ptr = NULL;
+static uintptr_t *s_hud_s_pInstance_ptr = NULL;
 
 // Touch slot manager (max 5 slots, strictly complying with psvita-porting input_handling reference)
 #define MAX_TOUCH_SLOTS 5
@@ -66,29 +66,7 @@ enum HudWidgetOffset {
     HUD_OFFSET_IGM           = 116, // button_toIGM
 };
 
-// Guard against dangling/garbage HudWidget*/Hud* left in the Hud widget
-// table. Three independent real crashes confirmed this is a real, recurring
-// class of bug, not a single one-off:
-//   - 0x4620656e (not 4-byte aligned) dereferencing widget+0x18 while
-//     pressing Cross with HUD_OFFSET_TUTORIAL_DLG stale.
-//   - 0x100 (4-byte aligned, but far too low to be any real object -- the
-//     loader is at 0x81000000, the .so at 0x98000000, and every real heap
-//     pointer observed in this port's logs sits well above 0x81000000) while
-//     pressing Triangle with HUD_OFFSET_SWITCH_MENU stale, right after the
-//     in-game menu closed.
-//   - 0x00010118 while pressing Triangle with HUD_OFFSET_SWITCH_MENU stale
-//     (confirmed via .psp2dmp: is_widget_active() read widget+0x18 fine --
-//     that low page happened to be mapped -- then faulted on widget+0xdc).
-//     This slipped through the previous MIN_PLAUSIBLE_PTR (0x00010000): being
-//     merely above the null guard page is not the same as being a real
-//     object. Every real heap/stack pointer this port has ever logged sits
-//     above 0x80000000, so the floor is raised to comfortably reject any
-//     small-int/near-NULL garbage while still never rejecting a live object.
-// A real HudWidget*/Hud* is always 4-byte aligned (it has a vtable) AND well
-// above the low guard-page region every OS reserves unmapped specifically so
-// small-integer/NULL-like bugs fault immediately -- so this can never reject
-// a genuinely live object, only the garbage the engine occasionally leaves
-// behind in its own widget table during HUD transitions.
+// Guard against dangling/garbage pointers in the Hud widget table.
 #define MIN_PLAUSIBLE_PTR 0x10000000u
 static bool is_plausible_ptr(uintptr_t p) {
     return p >= MIN_PLAUSIBLE_PTR && (p & 0x3) == 0;
@@ -96,33 +74,37 @@ static bool is_plausible_ptr(uintptr_t p) {
 
 static bool is_widget_active(uintptr_t widget, float *out_x, float *out_y) {
     if (!widget || !is_plausible_ptr(widget)) return false;
-    // widget + 0x18 is the visible/active flag in HudWidget
+    // widget + 0x18 is visible flag, widget + 0x19 is active flag in HudWidget
     uint8_t visible = *(uint8_t *)(widget + 0x18);
-    if (!visible) return false;
-    if (out_x) *out_x = *(float *)(widget + 0xdc);
-    if (out_y) *out_y = *(float *)(widget + 0xe0);
+    uint8_t active  = *(uint8_t *)(widget + 0x19);
+    if (!visible && !active) return false;
+
+    // In HudWidget::GetAbsolutePosition:
+    // x = widget[0xdc] + widget[0x114], y = widget[0xe0] + widget[0x118]
+    float x = *(float *)(widget + 0xdc) + *(float *)(widget + 0x114);
+    float y = *(float *)(widget + 0xe0) + *(float *)(widget + 0x118);
+
+    if (isnan(x) || isnan(y) || x < 0.0f || x >= SCREEN_W || y < 0.0f || y >= SCREEN_H) {
+        return false;
+    }
+
+    if (out_x) *out_x = x;
+    if (out_y) *out_y = y;
     return true;
 }
 
 static bool get_widget_pos(enum HudWidgetOffset offset, float *out_x, float *out_y) {
     if (!s_hud_s_pInstance_ptr || !*s_hud_s_pInstance_ptr) return false;
-    uintptr_t hud = **s_hud_s_pInstance_ptr;
+    uintptr_t hud = *s_hud_s_pInstance_ptr;
     if (!hud || !is_plausible_ptr(hud)) return false;
     uintptr_t widget = *(uintptr_t *)(hud + offset);
     return is_widget_active(widget, out_x, out_y);
 }
 
-// Force-hide a HUD widget (currently only the on-screen movement joystick):
-// physical controls fully replace it (hook_HudMovePad_Get_MovePad_AxisValues
-// reads the real stick/D-Pad directly, see below) and touching its on-screen
-// graphic does nothing in this port, so leaving it drawn is pure visual
-// clutter on top of the real control scheme. Reuses the same "visible" byte
-// (widget + 0x18) that is_widget_active() already reads -- every HUD widget
-// in this engine gates both its own touch handling AND its own draw call on
-// this single flag, so clearing it hides the graphic too, not just input.
+// Force-hide a HUD widget (movement joystick):
 static void hide_widget(enum HudWidgetOffset offset) {
     if (!s_hud_s_pInstance_ptr || !*s_hud_s_pInstance_ptr) return;
-    uintptr_t hud = **s_hud_s_pInstance_ptr;
+    uintptr_t hud = *s_hud_s_pInstance_ptr;
     if (!hud || !is_plausible_ptr(hud)) return;
     uintptr_t widget = *(uintptr_t *)(hud + offset);
     if (!widget || !is_plausible_ptr(widget)) return;
@@ -241,7 +223,7 @@ void controls_init(so_touch_fn touch_fn, so_key_fn key_down_fn, so_key_fn key_up
     }
 
     // Resolve pointer to Hud::s_pInstance
-    s_hud_s_pInstance_ptr = (uintptr_t **)so_symbol(&so_mod, "_ZN3Hud11s_pInstanceE");
+    s_hud_s_pInstance_ptr = (uintptr_t *)so_symbol(&so_mod, "_ZN3Hud11s_pInstanceE");
     if (s_hud_s_pInstance_ptr) {
         l_info("Resolved Hud::s_pInstance symbol successfully");
     } else {
@@ -259,11 +241,6 @@ void controls_update(void) {
     uint32_t pressed = s_current_buttons & ~s_old_buttons;
     uint32_t released = ~s_current_buttons & s_old_buttons;
 
-    // Check if defense / shield widget is active on screen
-    float def_x = 735.0f, def_y = 310.0f;
-    bool has_defense = get_widget_pos(HUD_OFFSET_DEFENSE, &def_x, &def_y) ||
-                       get_widget_pos(HUD_OFFSET_BLOCK, &def_x, &def_y);
-
     // Physical controls fully replace the on-screen virtual movement
     // joystick (see hook_HudMovePad_Get_MovePad_AxisValues); its touch
     // graphic is non-functional noise on a physical-control HUD, so keep it
@@ -271,22 +248,12 @@ void controls_update(void) {
     hide_widget(HUD_OFFSET_MOVEPAD);
 
     // Menu Key Events:
-    // START -> KEYCODE_MENU (82) / KEYCODE_BACK (4)
+    // START -> KEYCODE_BACK (4) / Menu
     if (pressed & SCE_CTRL_START) {
         if (s_nativeKeyDown) s_nativeKeyDown(s_jniEnv, NULL, 4);
     }
     if (released & SCE_CTRL_START) {
         if (s_nativeKeyUp) s_nativeKeyUp(s_jniEnv, NULL, 4);
-    }
-
-    // CIRCLE -> KEYCODE_BACK (4) in menus / dialogs (when defense is not active)
-    if (!has_defense) {
-        if (pressed & SCE_CTRL_CIRCLE) {
-            if (s_nativeKeyDown) s_nativeKeyDown(s_jniEnv, NULL, 4);
-        }
-        if (released & SCE_CTRL_CIRCLE) {
-            if (s_nativeKeyUp) s_nativeKeyUp(s_jniEnv, NULL, 4);
-        }
     }
 
     // Touch collection
@@ -309,28 +276,31 @@ void controls_update(void) {
     }
 
     // 2. Physical Button to Virtual Widget mappings (using stable negative IDs):
-    // User-requested face-button scheme (2026-09-16): X = sword, Circle =
-    // shield (already handled below via has_defense), Triangle = horse,
-    // Square = map. Start stays as menu (unchanged).
-    //
-    // CROSS (X): Sword Attack, falling back to contextual Action/Interact
+    // Scheme:
+    // CROSS (X)    = Sword Attack (contextual interact fallback when active)
+    // CIRCLE       = Shield / Defense (never opens menu)
+    // SQUARE       = Minimap (lower down on right side, never top-right sword)
+    // TRIANGLE     = Horse (bottom-right corner)
+    // L-TRIGGER    = Shield / Defense or Target Lock
+    // R-TRIGGER    = Horse
+    // SELECT       = Weapon Switch / In-Game Menu (top-right corner)
+
+    // CROSS (X): Sword Attack, with contextual interaction priority
     // (dialog advance, cutscene skip, talk to NPC, treasure, bomb, push box,
-    // mirror) when no attack widget is active -- these HUD buttons are never
-    // shown at the same time in the game's own UI (combat vs. exploration),
-    // so merging them costs nothing and keeps interaction accessible on X.
+    // mirror) when active; otherwise sword attack.
     if (g_pad.buttons & SCE_CTRL_CROSS) {
-        float x = 635.0f, y = 385.0f;
-        if (!get_widget_pos(HUD_OFFSET_ATTACK, &x, &y) &&
-            !get_widget_pos(HUD_OFFSET_SWORD, &x, &y) &&
-            !get_widget_pos(HUD_OFFSET_TUTORIAL_DLG, &x, &y) &&
+        float x = 740.0f, y = 360.0f;
+        if (!get_widget_pos(HUD_OFFSET_TUTORIAL_DLG, &x, &y) &&
             !get_widget_pos(HUD_OFFSET_CUTSCENE, &x, &y) &&
             !get_widget_pos(HUD_OFFSET_TALK_NPC, &x, &y) &&
             !get_widget_pos(HUD_OFFSET_OPEN_TREASURE, &x, &y) &&
             !get_widget_pos(HUD_OFFSET_PICK_BOMB, &x, &y) &&
             !get_widget_pos(HUD_OFFSET_PUSH_BOX, &x, &y) &&
             !get_widget_pos(HUD_OFFSET_ROTATE_MIRROR, &x, &y) &&
-            !get_widget_pos(HUD_OFFSET_ACTION, &x, &y)) {
-            x = 635.0f; y = 385.0f;
+            !get_widget_pos(HUD_OFFSET_ACTION, &x, &y) &&
+            !get_widget_pos(HUD_OFFSET_ATTACK, &x, &y) &&
+            !get_widget_pos(HUD_OFFSET_SWORD, &x, &y)) {
+            x = 740.0f; y = 360.0f;
         }
         if (num_reports < MAX_REPORTS) {
             reports[num_reports].id = -2; // Virtual ID for Cross
@@ -340,11 +310,26 @@ void controls_update(void) {
         }
     }
 
-    // SQUARE: Map / Minimap
+    // CIRCLE: Defense / Shield in gameplay (never opens menu)
+    if (g_pad.buttons & SCE_CTRL_CIRCLE) {
+        float x = 630.0f, y = 425.0f;
+        if (!get_widget_pos(HUD_OFFSET_DEFENSE, &x, &y) &&
+            !get_widget_pos(HUD_OFFSET_BLOCK, &x, &y)) {
+            x = 630.0f; y = 425.0f;
+        }
+        if (num_reports < MAX_REPORTS) {
+            reports[num_reports].id = -5; // Virtual ID for Circle Shield
+            reports[num_reports].x = (int)x;
+            reports[num_reports].y = (int)y;
+            num_reports++;
+        }
+    }
+
+    // SQUARE: Map / Minimap (lower down on right side, never top-right sword)
     if (g_pad.buttons & SCE_CTRL_SQUARE) {
-        float x = 765.0f, y = 35.0f;
-        if (!get_widget_pos(HUD_OFFSET_MINI_MAP, &x, &y)) {
-            x = 765.0f; y = 35.0f;
+        float x = 725.0f, y = 120.0f;
+        if (!get_widget_pos(HUD_OFFSET_MINI_MAP, &x, &y) || y < 60.0f) {
+            x = 725.0f; y = 120.0f;
         }
         if (num_reports < MAX_REPORTS) {
             reports[num_reports].id = -3; // Virtual ID for Square
@@ -354,12 +339,12 @@ void controls_update(void) {
         }
     }
 
-    // TRIANGLE: Mount / Dismount Horse
+    // TRIANGLE: Mount / Dismount Horse (bottom-right corner)
     if (g_pad.buttons & SCE_CTRL_TRIANGLE) {
-        float x = 745.0f, y = 205.0f;
+        float x = 775.0f, y = 452.0f;
         if (!get_widget_pos(HUD_OFFSET_CHANGE_HORSE, &x, &y) &&
             !get_widget_pos(HUD_OFFSET_CHANGE_RUN, &x, &y)) {
-            x = 745.0f; y = 205.0f;
+            x = 775.0f; y = 452.0f;
         }
         if (num_reports < MAX_REPORTS) {
             reports[num_reports].id = -4; // Virtual ID for Triangle
@@ -369,23 +354,13 @@ void controls_update(void) {
         }
     }
 
-    // CIRCLE: Defense / Guard in gameplay
-    if ((g_pad.buttons & SCE_CTRL_CIRCLE) && has_defense) {
-        if (num_reports < MAX_REPORTS) {
-            reports[num_reports].id = -5; // Virtual ID for Circle Shield
-            reports[num_reports].x = (int)def_x;
-            reports[num_reports].y = (int)def_y;
-            num_reports++;
-        }
-    }
-
     // L TRIGGER: Defense / Shield or Target Lock
     if (g_pad.buttons & SCE_CTRL_LTRIGGER) {
-        float x = 735.0f, y = 310.0f;
+        float x = 630.0f, y = 425.0f;
         if (!get_widget_pos(HUD_OFFSET_DEFENSE, &x, &y) &&
             !get_widget_pos(HUD_OFFSET_BLOCK, &x, &y) &&
             !get_widget_pos(HUD_OFFSET_TARGET_CROSS, &x, &y)) {
-            x = 735.0f; y = 310.0f;
+            x = 630.0f; y = 425.0f;
         }
         if (num_reports < MAX_REPORTS) {
             reports[num_reports].id = -6; // Virtual ID for L Trigger
@@ -395,13 +370,12 @@ void controls_update(void) {
         }
     }
 
-    // R TRIGGER: Mount / Dismount Horse or Secondary Attack
+    // R TRIGGER: Mount / Dismount Horse
     if (g_pad.buttons & SCE_CTRL_RTRIGGER) {
-        float x = 745.0f, y = 205.0f;
+        float x = 775.0f, y = 452.0f;
         if (!get_widget_pos(HUD_OFFSET_CHANGE_HORSE, &x, &y) &&
-            !get_widget_pos(HUD_OFFSET_CHANGE_RUN, &x, &y) &&
-            !get_widget_pos(HUD_OFFSET_ATTACK, &x, &y)) {
-            x = 745.0f; y = 205.0f;
+            !get_widget_pos(HUD_OFFSET_CHANGE_RUN, &x, &y)) {
+            x = 775.0f; y = 452.0f;
         }
         if (num_reports < MAX_REPORTS) {
             reports[num_reports].id = -7; // Virtual ID for R Trigger
@@ -411,11 +385,13 @@ void controls_update(void) {
         }
     }
 
-    // SELECT: In-Game Menu / Bag / Minimap
+    // SELECT: In-Game Menu / Bag / Weapon Switch (top-right corner)
     if (g_pad.buttons & SCE_CTRL_SELECT) {
         float x = 765.0f, y = 35.0f;
         if (!get_widget_pos(HUD_OFFSET_IGM, &x, &y) &&
-            !get_widget_pos(HUD_OFFSET_MINI_MAP, &x, &y)) {
+            !get_widget_pos(HUD_OFFSET_SYS_IGM, &x, &y) &&
+            !get_widget_pos(HUD_OFFSET_SWITCH_WEAPON, &x, &y) &&
+            !get_widget_pos(HUD_OFFSET_SWORD, &x, &y)) {
             x = 765.0f; y = 35.0f;
         }
         if (num_reports < MAX_REPORTS) {

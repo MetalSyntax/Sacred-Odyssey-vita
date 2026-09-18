@@ -3268,3 +3268,110 @@ Village/Savage/machang) + screenshot `screenshots/hj/2026-09-16/2026-09-16-20450
   el nuevo mapeo de botones (X=espada, Cuadrado=mapa, Triángulo=caballo, Círculo=escudo), confirmar que el
   joystick virtual ya no se dibuja en pantalla, y traer screenshot + log de la escena donde persista
   alguna textura negra.
+
+## Sesión 2026-09-16 (cont.) — Corrección integral del mapeo de botones físicos y causa raíz del bug de Hud::s_pInstance
+
+- **Reporte del usuario:**
+  - Círculo sigue abriendo el menú y no toca el escudo.
+  - Cruz (X) no hace nada.
+  - Cuadrado toca la espada de la esquina superior derecha en vez del mapa más abajo.
+  - Triángulo debe montar/desmontar el caballo.
+  - Referencias: log `log_20260916_213114.txt` y captura `screenshots/hj/2026-09-16/2026-09-16-204503.jpg`.
+
+- **Causa raíz descubierta (doble desreferenciación en `controls.c`):**
+  - La variable global estática `s_hud_s_pInstance_ptr` estaba tipada como `uintptr_t **` y en `get_widget_pos` y `hide_widget` se realizaba `uintptr_t hud = **s_hud_s_pInstance_ptr;`.
+  - En la biblioteca nativa, el símbolo `_ZN3Hud11s_pInstanceE` es un puntero directo al objeto `Hud` (`Hud *Hud::s_pInstance`).
+  - Al hacer doble desreferenciación `**s_hud_s_pInstance_ptr`, en vez de obtener el puntero al objeto `Hud`, se desreferenciaban los primeros 4 bytes de `Hud` (que contienen `HudEngine *` creado en `Hud::Load`). Por ello, las búsquedas de widgets sumaban offsets de `Hud` sobre `HudEngine`, obteniendo punteros basura o NULL, lo que provocaba que `get_widget_pos` fallara siempre y se recurriera a los valores de fallback.
+  - **Fix:** tipado a `uintptr_t *s_hud_s_pInstance_ptr` y desreferenciación simple `uintptr_t hud = *s_hud_s_pInstance_ptr;`.
+
+- **Corrección de la posición absoluta de widgets:**
+  - En `is_widget_active()`, se implementó el cálculo real del motor (de `HudWidget::GetAbsolutePosition`): `x = widget[0xdc] + widget[0x114]` e `y = widget[0xe0] + widget[0x118]`, junto a validaciones de rango y comprobación de `visible` (`0x18`) o `active` (`0x19`).
+
+- **Corrección precisa de los botones físicos (`source/controls.c`):**
+  1. **CÍRCULO (Escudo):**
+     - Se eliminó el envío de `KEYCODE_BACK (4)`. El menú de pausa queda exclusivamente asignado al botón START.
+     - Círculo ahora pulsa el botón de escudo (`HUD_OFFSET_DEFENSE` / `HUD_OFFSET_BLOCK`), con fallback a las coordenadas reales calculadas en resolución 800x480: `(630.0f, 425.0f)` (ubicado a la izquierda del caballo en la parte inferior).
+  2. **CRUZ / X (Espada / Ataque e Interacción):**
+     - Ahora prioriza las interacciones contextuales activas (`HUD_OFFSET_TUTORIAL_DLG`, `HUD_OFFSET_CUTSCENE`, `HUD_OFFSET_TALK_NPC`, `HUD_OFFSET_OPEN_TREASURE`, `HUD_OFFSET_PICK_BOMB`, `HUD_OFFSET_PUSH_BOX`, `HUD_OFFSET_ROTATE_MIRROR`, `HUD_OFFSET_ACTION`) y por defecto ataca con la espada (`HUD_OFFSET_ATTACK` / `HUD_OFFSET_SWORD`).
+     - Coordenadas de fallback corregidas de `(635, 385)` (espacio vacío que no hacía nada) a las coordenadas reales del botón de espada de fuego: `(740.0f, 360.0f)` (confirmadas por los logs de audio `sfx_MC_sword_swipe` alrededor de 735-755, 340-360).
+  3. **CUADRADO (Mapa):**
+     - Coordenadas de fallback corregidas de `(765, 35)` (que correspondía al ícono de cambio de arma en la esquina superior derecha) al centro del minimapa: `(725.0f, 120.0f)`.
+     - Se añadió protección para descartar posiciones con `y < 60.0f` para asegurar que jamás toque el ícono de espada superior.
+  4. **TRIÁNGULO (Caballo):**
+     - Fallback corregido de `(745, 205)` a la posición real del ícono del caballo en la esquina inferior derecha: `(775.0f, 452.0f)` (confirmado en el log al ejecutar la carga del modelo Collada `horseappear.bdae` en x=772..795, y=449..455).
+  5. **L TRIGGER / R TRIGGER / SELECT:**
+     - L Trigger: Escudo (`630, 425`) / Target Cross.
+     - R Trigger: Caballo (`775, 452`).
+     - Select: Menú de armas / IGM en esquina superior derecha (`765, 35`).
+
+- **Validación:**
+  - Compilación limpia con `psvita-toolkit build`. Binarios `eboot.bin` y `sacredodyssey.vpk` actualizados.
+
+## Sesión 2026-09-17 — Audio real: bridge `android/media/AudioTrack` -> `sceAudioOut` (Fase 11)
+
+- **Motivo:** pedido explícito del usuario ("agrega sonido al juego, hazlo funcionar"). El juego venía
+  mudo desde el arranque del port -- ya diagnosticado varias veces en este archivo (Fase 8, sesiones
+  2026-09-06 y 2026-09-12) pero nunca resuelto: `source/java.c` no tenía NINGUNA entrada para
+  `android/media/AudioTrack` (`<init>`/`getMinBufferSize`/`play`/`pause`/`stop`/`release`/`write`),
+  así que `GetMethodID` fallaba para las siete, el middleware nativo VOX del motor (no Java) quedaba con
+  el driver de audio sin inicializar, y el juego seguía sin trabarse (no es un patrón "cuelga esperando
+  callback", ver `references/jni_stubs.md`) pero completamente silencioso.
+- **Confirmación exacta contra el `.so` real (no una suposición por analogía):** se desensambló
+  `vox::DriverAndroid::_InitAT` en `decompiled/decompiled_so/libsacredodyssey_v106/out_ghidra.c` (líneas
+  ~143940-144020):
+  - `DriverCallbackSourceInterface::SetDriverSampleRate(0xac44)` -> **44100 Hz**.
+  - `FindClass("android/media/AudioTrack")`, `GetMethodID(cls, "<init>", "(IIIIII)V")`.
+  - `GetMethodID(cls, "getMinBufferSize", "(III)I")` y la llamada real:
+    `CallStaticIntMethod(cls, getMinBufferSize, 44100, 0xc, 2)` -> **stereo (`CHANNEL_OUT_STEREO`=12),
+    PCM 16-bit (`ENCODING_PCM_16BIT`=2)**.
+  - `GetMethodID` de `"play"`/`"pause"`/`"stop"`/`"release"` (todas `"()V"`) y `"write"` (`"([BII)I"`).
+  - `vox::DriverAndroid::DoCallbackAT` (línea ~144264) confirma el patrón real de uso: obtiene el puntero
+    crudo del `jbyteArray` con `GetByteArrayElements`, lo llena directo en C++ vía
+    `DriverCallbackInterface::_FillBuffer`, hace `ReleaseByteArrayElements`, y llama
+    `CallNonvirtualIntMethod(..., mWrite, array, 0, frames*4)` -- el motor mezcla y decodifica TODO
+    (`.wav`/`.vxn`) en código nativo y solo usa `AudioTrack.write()` como sink final de salida, nunca los
+    métodos de `GLMediaPlayer` (`loadSound`/`playSound`/etc., que siguen siendo no-ops en `java.c` --
+    correcto dejarlos así, evidencia consistente con la escaneada alfabética por `fopen()` del catálogo
+    de audio ya documentada en sesiones anteriores, que es el propio VOX leyendo los archivos, no Java).
+  - **Confirmación cruzada:** la MISMA arquitectura (mismo motor Gameloft "Glitch", mismo
+    `vox::DriverAndroid`, mismos 7 métodos, mismas firmas JNI, mismo 44100 Hz stereo 16-bit) ya está
+    resuelta y probada en consola en el port hermano `Dungeon-Hunter-2-vita` (`source/audio.cpp`/`.h`,
+    ver su `Docs/audio_comments.md`) -- el diseño de este fix replica esa arquitectura ya validada en
+    hardware real, adaptada a este proyecto (sin el mixer de voces de `GLMediaPlayer`, que en Sacred
+    Odyssey ya se había determinado no-op/legacy en las sesiones de audio previas de este mismo archivo).
+- **Implementación:**
+  - **`source/audio.h`/`source/audio.c` (nuevos):** `audio_init()`/`audio_shutdown()` abren un puerto
+    `sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_BGM, 1024, 44100, SCE_AUDIO_OUT_MODE_STEREO)` y lanzan un
+    hilo dedicado (`audiotrack_output_thread`, afinidad `SCE_KERNEL_CPU_MASK_USER_1`, fuera del core del
+    hilo principal) que en cada iteración drena un FIFO circular protegido por mutex hacia
+    `sceAudioOutOutput`, rellenando con silencio si VOX todavía no produjo suficiente dato (nunca bloquea
+    el frame principal).
+    - `audiotrack_write()`: intercepta `AudioTrack.write(byte[], offset, sizeInBytes)` -- lee
+      directamente `JavaDynArray->array` (mismo patrón ya usado en este archivo por
+      `res_get_bytes`/`res_get_full`), copia al FIFO con backpressure (duerme brevemente si está lleno en
+      vez de descartar datos, replicando el bloqueo real de `AudioTrack.write()` en `MODE_STREAM` que
+      `UpdateThreadedAT` espera).
+    - `audiotrack_ctor()`/`audiotrack_get_min_buffer_size()`/`audiotrack_noop_void()` (`play`/`pause`/
+      `stop`): stubs seguros -- VOX solo usa el valor de retorno de `getMinBufferSize` para dimensionar su
+      propio contador interno (`m_dataThreshold`/`m_updateTime`), no para decidir si el audio "funciona".
+    - `audiotrack_release()`: limpia el FIFO.
+  - **`source/java.c`:** agregadas las 7 entradas a `nameToMethodId[]` (`android/media/AudioTrack/<init>`
+    calificado por clase, igual que ya hace este archivo para constructores -- ver `GetMethodID` en
+    `FalsoJNI.c`; el resto por nombre plano, sin colisión con ningún nombre ya registrado) y wireadas en
+    `methodsInt`/`methodsObject`/`methodsVoid`. Incluye `audio.h`.
+  - **`source/main.c`:** `audio_init()` llamado tras `gl_init()` (antes de la secuencia
+    `Device.nativeInit`/`GameRenderer.nativeInit`/etc.) y `audio_shutdown()` al salir del loop principal.
+  - **`CMakeLists.txt`:** agregado `source/audio.c` a `add_executable`. `SceAudio_stub` ya estaba
+    enlazado (usado por el logging de red, sin relación) -- no hizo falta agregar nada más.
+- **Validación:**
+  - `psvita-toolkit build --preset debug`: build 100% limpio (`source/audio.c` compila sin warnings
+    propios). `nm build/sacredodyssey.elf | grep audiotrack` confirma los 6 símbolos
+    (`audiotrack_ctor`/`_get_min_buffer_size`/`_noop_void`/`_output_thread`/`_release`/`_write`)
+    presentes en el binario final. `eboot.bin` (617 KB) y `sacredodyssey.vpk` (1.24 MB) regenerados y
+    sincronizados a la raíz del proyecto.
+- **Pendiente (consola física):** desplegar el `.vpk` completo (necesario: aunque este cambio es solo
+  código/eboot, seguir la convención ya establecida de este proyecto de reinstalar el VPK completo tras
+  cambios grandes) y confirmar en el log las líneas `[audio] sceAudioOut ready (...)` y, más importante,
+  `[audio] first AudioTrack.write() call (...) -- Vox output path is alive` (aparecería en cuanto el
+  splash empiece a precargar el catálogo de sonidos, mismo punto donde antes solo se veía el escaneo
+  `fopen()` sin ningún log de audio) -- y, por supuesto, escuchar sonido real por primera vez.

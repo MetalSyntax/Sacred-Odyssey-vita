@@ -10,6 +10,7 @@
 
 #include "utils/logger.h"
 #include "utils/utils.h"
+#include "audio.h"
 #include <so_util/so_util.h>
 #include <kubridge.h>
 
@@ -276,6 +277,18 @@ enum {
     MID_RES_GET_FULL,
     MID_EMPTY_BYTE_ARRAY,
     MID_PLAY_VIDEO,
+
+    // android/media/AudioTrack shim (see audio.h/audio.c) -- the real fix for
+    // Sacred Odyssey's silent audio: the Gameloft "Glitch" engine's native
+    // VOX middleware (vox::DriverAndroid) decodes/mixes everything itself and
+    // only uses AudioTrack as its final output sink.
+    MID_AUDIOTRACK_CTOR,
+    MID_AUDIOTRACK_GET_MIN_BUFFER_SIZE,
+    MID_AUDIOTRACK_WRITE,
+    MID_AUDIOTRACK_PLAY,
+    MID_AUDIOTRACK_PAUSE,
+    MID_AUDIOTRACK_STOP,
+    MID_AUDIOTRACK_RELEASE,
 };
 
 NameToMethodID nameToMethodId[] = {
@@ -389,6 +402,18 @@ NameToMethodID nameToMethodId[] = {
     { MID_GENERIC_VOID, "PauseMusicBG", METHOD_TYPE_VOID },
     { MID_GENERIC_VOID, "ResumeMusicBG", METHOD_TYPE_VOID },
     { MID_GENERIC_VOID, "ChangeMusic", METHOD_TYPE_VOID },
+
+    // android/media/AudioTrack (see audio.h) -- constructor is qualified by
+    // class name (FalsoJNI's GetMethodID convention for "<init>", see
+    // FalsoJNI.c), the rest are looked up by their plain method name; none of
+    // them collide with any name already registered above.
+    { MID_AUDIOTRACK_CTOR, "android/media/AudioTrack/<init>", METHOD_TYPE_OBJECT },
+    { MID_AUDIOTRACK_GET_MIN_BUFFER_SIZE, "getMinBufferSize", METHOD_TYPE_INT },
+    { MID_AUDIOTRACK_WRITE, "write", METHOD_TYPE_INT },
+    { MID_AUDIOTRACK_PLAY, "play", METHOD_TYPE_VOID },
+    { MID_AUDIOTRACK_PAUSE, "pause", METHOD_TYPE_VOID },
+    { MID_AUDIOTRACK_STOP, "stop", METHOD_TYPE_VOID },
+    { MID_AUDIOTRACK_RELEASE, "release", METHOD_TYPE_VOID },
 };
 
 MethodsBoolean methodsBoolean[] = {
@@ -408,6 +433,8 @@ MethodsInt methodsInt[] = {
     { MID_GET_HEIGHT, integer_height },
     { MID_GET_MANUFACTURE, integer_manufacturer_sony },
     { MID_RES_GET_LENGTH, res_get_length },
+    { MID_AUDIOTRACK_GET_MIN_BUFFER_SIZE, audiotrack_get_min_buffer_size },
+    { MID_AUDIOTRACK_WRITE, audiotrack_write },
 };
 
 MethodsLong methodsLong[] = {
@@ -428,6 +455,7 @@ MethodsObject methodsObject[] = {
     { MID_RES_GET_BYTES, res_get_bytes },
     { MID_RES_GET_FULL, res_get_full },
     { MID_EMPTY_BYTE_ARRAY, empty_byte_array },
+    { MID_AUDIOTRACK_CTOR, audiotrack_ctor },
 };
 
 MethodsShort methodsShort[] = {};
@@ -436,6 +464,10 @@ MethodsVoid methodsVoid[] = {
     { MID_GENERIC_VOID, method_void_stub },
     { MID_EXIT, method_exit },
     { MID_PLAY_VIDEO, method_play_video },
+    { MID_AUDIOTRACK_PLAY, audiotrack_noop_void },
+    { MID_AUDIOTRACK_PAUSE, audiotrack_noop_void },
+    { MID_AUDIOTRACK_STOP, audiotrack_noop_void },
+    { MID_AUDIOTRACK_RELEASE, audiotrack_release },
 };
 
 const int SDK_INT = 10; // Android 2.3.4 Gingerbread

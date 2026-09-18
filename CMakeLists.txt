@@ -89,6 +89,7 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/java.c
                source/patch.c
                source/controls.c
+               source/audio.c
                source/reimpl/bits/_ctype.c
                source/reimpl/errno.c
                source/reimpl/fmt.c
