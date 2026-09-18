@@ -3479,3 +3479,28 @@ Village/Savage/machang) + screenshot `screenshots/hj/2026-09-16/2026-09-16-20450
   ven tenues (no invisibles) en pantalla, que tocarlos directamente en la pantalla táctil real TODAVÍA
   funciona (validación de que `dim_widget` no rompió el hit-test), y que salir del juego desde su menú
   ahora sí vuelve al LiveArea en vez de quedarse congelado.
+
+## Sesión 2026-09-17 (cont.) — Corrección de una afirmación propia incorrecta sobre el joystick virtual
+
+- **Corrección del usuario:** "El joystick virtual con esa bandera nunca funciono, ojo con eso" -- en el
+  resumen de la entrada anterior afirmé que pasar de `hide_widget()` (bandera `visible`) a `dim_widget()`
+  (alpha) "preservaba el touch real" para el joystick también. Eso es incorrecto y ya estaba documentado
+  en ESTE MISMO archivo (sesión 2026-09-16, cuando se agregó `hide_widget()` por primera vez): "el usuario
+  confirmó que tocarlo en pantalla no hace nada" -- el touch sobre el joystick virtual nunca funcionó,
+  independientemente de esta bandera o de cualquier cambio de esta sesión. Cambiar de `hide` a `dim` no
+  "arregla" ni "preserva" nada para el joystick puntualmente -- no había nada funcionando que preservar.
+  El razonamiento de `dim_widget` SÍ aplica correctamente a los botones de acción (su touch real es la
+  MISMA vía que usan los taps sintéticos de los botones físicos, confirmado por los propios logs de
+  `[controls] ... tap` funcionando), solo la generalización al joystick era el error.
+- **Corregido, sin adivinar de nuevo:** en vez de solo arreglar el comentario, se agregó diagnóstico real
+  (`source/controls.c`, `dim_widget()`): un log `l_info` una única vez por offset (`s_dim_logged[128]`,
+  para no volver a caer en el mismo error de afirmar sin evidencia), reportando si el `HudWidget`/
+  `AnimObject` de cada botón atenuado (incluido `HUD_OFFSET_MOVEPAD`) efectivamente resuelve un puntero
+  plausible o si `dim_widget` viene siendo un no-op silencioso. Comentario de `dim_widget`/
+  `s_animobject_set_alpha` actualizado para no repetir la generalización incorrecta.
+- **Validación:** `psvita-toolkit build --preset debug` limpio. `eboot.bin`/`sacredodyssey.vpk`
+  regenerados y desplegados (`psvita-toolkit deploy --eboot --yes`, FTP respondió).
+- **Pendiente (consola física):** traer el próximo log y revisar las 13 líneas
+  `[controls] dim_widget(offset=N): ...` (una por botón atenuado) -- confirmarán con certeza cuáles de
+  estos widgets (empezando por `HUD_OFFSET_MOVEPAD=4`) realmente resuelven puntero y cuáles vienen siendo
+  ignorados en silencio desde que se agregó `hide_widget()` originalmente.

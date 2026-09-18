@@ -121,17 +121,50 @@ static bool get_widget_pos(enum HudWidgetOffset offset, float *out_x, float *out
 // above) while becoming visually unobtrusive now that physical controls
 // duplicate it. HudWidget::Activate/DeActivate (decompiled) confirm offset
 // +4 holds the widget's AnimObject* (`*(AnimObject **)(in_r0 + 4)`).
+//
+// IMPORTANT correction (user feedback, 2026-09-17): touching the on-screen
+// movement joystick was ALREADY confirmed non-functional before ANY of this
+// hide/dim code existed (see the 2026-09-16 session that first added
+// hide_widget() for HUD_OFFSET_MOVEPAD -- "el usuario confirmó que tocarlo en
+// pantalla no hace nada"). So for the joystick specifically, switching from
+// hide (visible=0) to dim (alpha-only) does NOT "restore" or "preserve" any
+// working touch behavior -- there wasn't any to preserve. The alpha approach
+// still matters for the ACTION buttons (attack/shield/horse/map/menu), whose
+// touch DOES matter (it's the exact mechanism the physical-button synthetic
+// taps rely on to register a hit). Don't assume dim_widget "fixed" anything
+// for the joystick's touch -- it didn't need fixing, it was never there.
+//
+// Also: never independently confirmed on-console that HUD_OFFSET_MOVEPAD's
+// widget/AnimObject pointers actually resolve (vs. silently no-op'ing every
+// frame via the is_plausible_ptr guards below) -- logged once per offset the
+// first time this runs so the next log settles it instead of assuming.
 #define DIM_ALPHA 18 // ~7% opacity (0-255 scale, confirmed via ASprite::SetAlpha/AnimObject::SetAlpha call sites using 0/0xff as the full range)
+static int8_t s_dim_logged[128] = {0}; // 0=not yet logged, 1=logged-resolved, 2=logged-unresolved
 static void dim_widget(enum HudWidgetOffset offset, int alpha) {
-    if (!s_animobject_set_alpha) return;
-    if (!s_hud_s_pInstance_ptr || !*s_hud_s_pInstance_ptr) return;
-    uintptr_t hud = *s_hud_s_pInstance_ptr;
-    if (!hud || !is_plausible_ptr(hud)) return;
-    uintptr_t widget = *(uintptr_t *)(hud + offset);
-    if (!widget || !is_plausible_ptr(widget)) return;
-    uintptr_t anim = *(uintptr_t *)(widget + 4);
-    if (!anim || !is_plausible_ptr(anim)) return;
-    s_animobject_set_alpha(anim, alpha);
+    bool resolved = false;
+    uintptr_t anim = 0;
+
+    if (s_hud_s_pInstance_ptr && *s_hud_s_pInstance_ptr) {
+        uintptr_t hud = *s_hud_s_pInstance_ptr;
+        if (hud && is_plausible_ptr(hud)) {
+            uintptr_t widget = *(uintptr_t *)(hud + offset);
+            if (widget && is_plausible_ptr(widget)) {
+                anim = *(uintptr_t *)(widget + 4);
+                resolved = anim && is_plausible_ptr(anim);
+            }
+        }
+    }
+
+    int idx = (int)offset;
+    if (idx >= 0 && idx < (int)(sizeof(s_dim_logged) / sizeof(s_dim_logged[0])) && s_dim_logged[idx] == 0) {
+        s_dim_logged[idx] = resolved ? 1 : 2;
+        l_info("[controls] dim_widget(offset=%d): %s", idx,
+               resolved ? "widget/AnimObject resolved, alpha applied" : "NOT resolved -- stays at default opacity");
+    }
+
+    if (resolved && s_animobject_set_alpha) {
+        s_animobject_set_alpha(anim, alpha);
+    }
 }
 
 // Hook for HudMovePad::Get_MovePad_AxisValues (Left Analog Stick & D-Pad)
