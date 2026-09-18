@@ -37,6 +37,10 @@ static uintptr_t *s_hud_s_pInstance_ptr = NULL;
 // on these buttons while making them visually unobtrusive.
 static void (*s_animobject_set_alpha)(uintptr_t anim_obj, int alpha) = NULL;
 
+// Toggled by the L+R combo (see controls_update) to temporarily bring the
+// dimmed virtual HUD back to full opacity.
+static bool s_hud_full_opacity = false;
+
 // Touch slot manager (max 5 slots, strictly complying with psvita-porting input_handling reference)
 #define MAX_TOUCH_SLOTS 5
 static int s_slotHwId[MAX_TOUCH_SLOTS] = {-1, -1, -1, -1, -1};
@@ -164,6 +168,31 @@ static void dim_widget(enum HudWidgetOffset offset, int alpha) {
 
     if (resolved && s_animobject_set_alpha) {
         s_animobject_set_alpha(anim, alpha);
+    }
+}
+
+// The movement joystick graphic is TWO widgets: the outer base (HudWidget at
+// Hud+HUD_OFFSET_MOVEPAD, what dim_widget() above targets) and a separate
+// knob CHILD at base+0x160 (confirmed real, already read from in
+// hook_HudMovePad_Get_MovePad_AxisValues below for its position). Dimming
+// only the base left the knob at full opacity -- reported as "el joystick
+// sigue visible" -- so both need their own AnimObject dimmed independently.
+static void dim_movepad(int alpha) {
+    if (!s_hud_s_pInstance_ptr || !*s_hud_s_pInstance_ptr) return;
+    uintptr_t hud = *s_hud_s_pInstance_ptr;
+    if (!hud || !is_plausible_ptr(hud)) return;
+    uintptr_t base = *(uintptr_t *)(hud + HUD_OFFSET_MOVEPAD);
+    if (!base || !is_plausible_ptr(base)) return;
+
+    if (s_animobject_set_alpha) {
+        uintptr_t base_anim = *(uintptr_t *)(base + 4);
+        if (base_anim && is_plausible_ptr(base_anim)) s_animobject_set_alpha(base_anim, alpha);
+
+        uintptr_t knob = *(uintptr_t *)(base + 0x160);
+        if (knob && is_plausible_ptr(knob)) {
+            uintptr_t knob_anim = *(uintptr_t *)(knob + 4);
+            if (knob_anim && is_plausible_ptr(knob_anim)) s_animobject_set_alpha(knob_anim, alpha);
+        }
     }
 }
 
@@ -306,24 +335,45 @@ void controls_update(void) {
     uint32_t pressed = s_current_buttons & ~s_old_buttons;
     uint32_t released = ~s_current_buttons & s_old_buttons;
 
+    // L+R combo (both bumpers held together, edge-triggered so holding them
+    // doesn't flicker every frame) toggles the dimmed virtual HUD back to
+    // full opacity -- user-requested way to see (or touch-tap directly) the
+    // joystick, the action buttons, AND the top menu (HUD_OFFSET_SYS_IGM,
+    // left cluster)/sword (HUD_OFFSET_SWITCH_WEAPON/SWORD, right cluster)
+    // icons, distinct from the bottom attack sword (HUD_OFFSET_ATTACK,
+    // fixed-coordinate Cross tap, never dimmed differently from the rest of
+    // this list -- there is no separate "bottom sword" widget in this set to
+    // confuse it with). Also fires the L-Trigger/R-Trigger shield+horse taps
+    // simultaneously (both are still physical buttons in their own right) --
+    // accepted trade-off of reusing L+R for this secondary function.
+    {
+        bool lr_now = (g_pad.buttons & SCE_CTRL_LTRIGGER) && (g_pad.buttons & SCE_CTRL_RTRIGGER);
+        bool lr_before = (s_old_buttons & SCE_CTRL_LTRIGGER) && (s_old_buttons & SCE_CTRL_RTRIGGER);
+        if (lr_now && !lr_before) {
+            s_hud_full_opacity = !s_hud_full_opacity;
+            l_info("[controls] L+R combo -> virtual HUD %s", s_hud_full_opacity ? "revealed (full opacity)" : "dimmed again");
+        }
+    }
+    int hud_alpha = s_hud_full_opacity ? 255 : DIM_ALPHA;
+
     // Physical controls now duplicate every on-screen virtual button
     // (movement joystick + the action icons tapped synthetically below), so
     // dim them every frame to declutter the HUD -- via alpha (dim_widget),
     // NOT via the "visible" flag (hide_widget), so real touch and our own
     // synthetic taps below both keep working (see dim_widget()'s comment).
-    dim_widget(HUD_OFFSET_MOVEPAD, DIM_ALPHA);
-    dim_widget(HUD_OFFSET_CAMERAPAD, DIM_ALPHA);
-    dim_widget(HUD_OFFSET_ATTACK, DIM_ALPHA);
-    dim_widget(HUD_OFFSET_SWORD, DIM_ALPHA);
-    dim_widget(HUD_OFFSET_DEFENSE, DIM_ALPHA);
-    dim_widget(HUD_OFFSET_BLOCK, DIM_ALPHA);
-    dim_widget(HUD_OFFSET_CHANGE_HORSE, DIM_ALPHA);
-    dim_widget(HUD_OFFSET_CHANGE_RUN, DIM_ALPHA);
-    dim_widget(HUD_OFFSET_TARGET_CROSS, DIM_ALPHA);
-    dim_widget(HUD_OFFSET_MINI_MAP, DIM_ALPHA);
-    dim_widget(HUD_OFFSET_SYS_IGM, DIM_ALPHA);
-    dim_widget(HUD_OFFSET_IGM, DIM_ALPHA);
-    dim_widget(HUD_OFFSET_SWITCH_WEAPON, DIM_ALPHA);
+    dim_movepad(hud_alpha);
+    dim_widget(HUD_OFFSET_CAMERAPAD, hud_alpha);
+    dim_widget(HUD_OFFSET_ATTACK, hud_alpha);
+    dim_widget(HUD_OFFSET_SWORD, hud_alpha);
+    dim_widget(HUD_OFFSET_DEFENSE, hud_alpha);
+    dim_widget(HUD_OFFSET_BLOCK, hud_alpha);
+    dim_widget(HUD_OFFSET_CHANGE_HORSE, hud_alpha);
+    dim_widget(HUD_OFFSET_CHANGE_RUN, hud_alpha);
+    dim_widget(HUD_OFFSET_TARGET_CROSS, hud_alpha);
+    dim_widget(HUD_OFFSET_MINI_MAP, hud_alpha);
+    dim_widget(HUD_OFFSET_SYS_IGM, hud_alpha);
+    dim_widget(HUD_OFFSET_IGM, hud_alpha);
+    dim_widget(HUD_OFFSET_SWITCH_WEAPON, hud_alpha);
 
     // Menu Key Events:
     // START -> KEYCODE_BACK (4) / Menu

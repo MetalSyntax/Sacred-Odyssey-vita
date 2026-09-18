@@ -350,18 +350,24 @@ void glLinkProgram_soloader(GLuint program) {
             l_info("[program_init] program %u: initialized %s to identity", program, s_texmats[i]);
         }
     }
-    // Force texture1/texture2 (UnlitMultiTexturedFP.glsl) away from texture
-    // unit 0 by default. GLSL leaves an unset sampler uniform at its default
-    // value (0), same unit "texture" itself uses -- if a material only ever
-    // sets ONE of the two literal names (see embedded_shaders.c), the other
-    // one would silently sample the SAME image as the primary diffuse
-    // texture, pass the ">0.03 signal" guard trivially (it's a real image,
-    // not black), and multiply color by itself: a wrong darkening, not the
-    // "just skip it" behavior the guard is meant to provide. Unit 7 is
-    // guaranteed to exist (GLES2 requires >=8 image units) and nothing in
-    // this port ever binds a real texture there, so it reads back
-    // (0,0,0,0) until/unless the material's own binder overwrites it.
-    static const char *s_second_tex_units[] = { "texture1", "texture2" };
+    // Force texture1/texture2/Sampler1 away from texture unit 0 by default.
+    // GLSL leaves an unset sampler uniform at its default value (0), same
+    // unit "texture"/Sampler0 itself uses -- if a material only ever sets
+    // ONE of a shader's secondary-texture uniforms (see embedded_shaders.c:
+    // UnlitMultiTexturedFP's texture1/texture2, and ProfileCOMMON_emul_FS's
+    // Sampler1 for MULTITEXTURED materials, used by mc.bdae/magic_horse* --
+    // confirmed black-character/black-horse root cause, 2026-09-17: Sampler1
+    // defaulting to unit 0 makes `tex1 = texture2D(Sampler1, vTexCoord0)`
+    // read the SAME diffuse image `color` already holds, pass the ">0.03
+    // signal" guard trivially since it's real image data, and square the
+    // color against itself via `color *= tex1` -- a severe, wrong darkening
+    // that reads as "black" for most non-pure-white textures, not the
+    // "just skip it" behavior the guard is meant to provide), the other
+    // one would silently sample that same image. Unit 7 is guaranteed to
+    // exist (GLES2 requires >=8 image units) and nothing in this port ever
+    // binds a real texture there, so it reads back (0,0,0,0) until/unless
+    // the material's own binder overwrites it.
+    static const char *s_second_tex_units[] = { "texture1", "texture2", "Sampler1" };
     for (size_t i = 0; i < sizeof(s_second_tex_units) / sizeof(s_second_tex_units[0]); i++) {
         GLint loc = glGetUniformLocation(program, s_second_tex_units[i]);
         if (loc >= 0) {

@@ -3504,3 +3504,62 @@ Village/Savage/machang) + screenshot `screenshots/hj/2026-09-16/2026-09-16-20450
   `[controls] dim_widget(offset=N): ...` (una por botón atenuado) -- confirmarán con certeza cuáles de
   estos widgets (empezando por `HUD_OFFSET_MOVEPAD=4`) realmente resuelven puntero y cuáles vienen siendo
   ignorados en silencio desde que se agregó `hide_widget()` originalmente.
+
+## Sesión 2026-09-17 (cont.) — Combo L+R para revelar el HUD, joystick con knob sin atenuar, y causa raíz real de personaje/caballo negro
+
+- **Reporte del usuario (sin log/screenshot nuevo esta vez):**
+  1. Pedido de un combo físico (L+R) para poder hacer reaparecer el joystick y los botones de acción
+     atenuados -- el menú (arriba, izquierda) y la espada (arriba, derecha) deben aparecer con el combo,
+     sin confundirlos con los botones de abajo que también tienen espada (el de ataque).
+  2. El joystick "sigue visible" pese al `dim_widget(HUD_OFFSET_MOVEPAD, ...)` de la sesión anterior.
+  3. Personaje y caballo TODAVÍA con texturas negras -- bug ya documentado extensamente en este mismo
+     archivo (sesiones 2026-09-11/12, "Bug 2b") pero nunca confirmado resuelto.
+
+- **(1) Combo L+R implementado (`source/controls.c`):** detectado por flanco (`lr_now && !lr_before`,
+  ambos gatillos recién sostenidos juntos, no repetido mientras se mantienen) para no parpadear.
+  Alterna `s_hud_full_opacity`: cuando está activo, TODOS los widgets atenuados (joystick, ataque,
+  escudo, caballo, target-cross, minimap, `SYS_IGM`/`IGM`/`SWITCH_WEAPON` -- estos dos últimos son
+  justamente "el menú" y "la espada" de arriba que el usuario pidió, ya incluidos en la lista existente)
+  pasan a alpha 255 (opacidad completa) en vez de `DIM_ALPHA`; se loguea la transición
+  (`l_info("[controls] L+R combo -> ...")`). Efecto secundario aceptado: L+R también dispara sus propias
+  acciones individuales (escudo + caballo) al mismo tiempo que el toggle, ya documentado en el comentario
+  del código.
+- **(2) Joystick "sigue visible" -- causa real encontrada, no solo sospechada:** el joystick del motor
+  son DOS widgets distintos: la base (`Hud+HUD_OFFSET_MOVEPAD`, lo único que `dim_widget()` atenuaba) y
+  un hijo/knob separado en `base+0x160` -- offset YA confirmado real en este mismo archivo, reutilizado
+  tal cual de `hook_HudMovePad_Get_MovePad_AxisValues` (que ya lee su posición para el hook del stick
+  físico). Atenuar solo la base deja el knob (la parte que más se nota, el círculo interior que se
+  arrastra) a opacidad completa -- de ahí "sigue visible". **Fix:** nueva `dim_movepad()` que atenúa
+  la base Y el knob (cada uno con su propio `AnimObject` en `+4`) usando la misma cadena de guardas
+  `is_plausible_ptr`.
+- **(3) Personaje/caballo negros -- causa raíz real encontrada (no la limitación de skinning ya conocida):**
+  revisando `source/utils/glutil.c` (`glLinkProgram_soloader`) se encontró que el fix ya aplicado para
+  `texture1`/`texture2` (forzarlos a la unidad de textura 7, vacía, en vez de dejarlos en la unidad 0 por
+  defecto -- sesión 2026-09-16) **nunca se extendió a `Sampler1`**, el nombre de la segunda textura que
+  usa específicamente `ProfileCOMMON_emul_FS` (el shader MULTITEXTURED que usan los materiales de
+  `mc.bdae`/`magic_horse*.bdae`, confirmado leyendo `source/utils/embedded_shaders.c`). Con `Sampler1` en
+  la unidad 0 por defecto, `tex1 = texture2D(Sampler1, vTexCoord0)` lee la MISMA textura difusa que ya
+  está en `color`, pasa la guarda de señal `>0.03` trivialmente (es una imagen real, no negra), y
+  `color *= tex1` termina elevando al cuadrado la textura difusa contra sí misma -- un oscurecimiento
+  severo que para texturas de piel/armadura/pelaje ya oscuras (personaje, caballo) se ve directamente
+  negro. Es el MISMO mecanismo exacto que ya se diagnosticó y arregló para `texture1`/`texture2` de
+  `UnlitMultiTexturedFP.glsl`, solo que nunca se aplicó al nombre que usa este shader en particular.
+  - **Fix (`source/utils/glutil.c`):** agregado `"Sampler1"` al array `s_second_tex_units[]` que ya
+    fuerza sus uniforms a la unidad 7 (vacía) tras el link -- una sola línea, mismo mecanismo ya probado
+    en consola para `texture1`/`texture2`.
+  - **Nota importante:** esto NO es un fix del problema de skinning por bone-count ya documentado
+    (`ProfileCOMMON_emul_VS` sigue sin arrays `BoneMatrices`/etc. -- ese requiere generación de shader
+    por material, tarea grande separada, ver comentario en `embedded_shaders.c`). Este fix aborda
+    específicamente el ENNEGRECIMIENTO por textura-cuadrada-consigo-misma, que es plausiblemente la causa
+    dominante del reporte "negro" (el bind-pose de un mesh sin skinning se ve estático/rígido, no negro;
+    el color multiplicado por sí mismo sí se ve negro).
+- **Validación:** `psvita-toolkit build --preset debug` limpio (`nm` confirma `dim_movepad` presente).
+  `eboot.bin`/`sacredodyssey.vpk` regenerados. **Deploy pendiente:** la consola no respondió por FTP
+  (`Errno 61`, Connection refused) -- falta abrir VitaShell y activar FTP con SELECT antes de
+  `psvita-toolkit deploy --eboot --yes`.
+- **Pendiente (consola física, tras desplegar):** confirmar que el combo L+R revela el joystick/botones
+  de acción/menú-espada de arriba a opacidad completa y los vuelve a atenuar al repetirlo; que el knob
+  del joystick ya no queda visible al dimmer normal; y, lo más importante, screenshot fresco del
+  personaje/caballo para confirmar si el fix de `Sampler1` resolvió el negro o si la limitación de
+  skinning (bind pose sin animación, no cubierta por este fix) sigue siendo visible como un problema
+  aparte.
