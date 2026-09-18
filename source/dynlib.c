@@ -518,7 +518,7 @@ so_default_dynlib default_dynlib[] = {
         { "glActiveTexture", (uintptr_t)&glActiveTexture },
         { "glAlphaFunc", (uintptr_t)&glAlphaFunc },
         { "glAlphaFuncx", (uintptr_t)&glAlphaFuncx },
-        { "glAttachShader", (uintptr_t)&glAttachShader },
+        { "glAttachShader", (uintptr_t)&glAttachShader_soloader },
         { "glBindAttribLocation", (uintptr_t)&glBindAttribLocation },
         { "glBindBuffer", (uintptr_t)&glBindBuffer },
         { "glBindFramebuffer", (uintptr_t)&glBindFramebuffer_soloader },

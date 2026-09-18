@@ -36,6 +36,13 @@ void glCompileShader_soloader(GLuint shader);
 
 void glLinkProgram_soloader(GLuint program);
 
+// Tracks shader->program attachment so the MULTITEXTURED+SKINNED family
+// (character/horse materials, see glShaderSource_soloader's watch-flagging)
+// can be identified by program id downstream, at glUniform*/glGetUniform-
+// Location time -- otherwise indistinguishable from any other program once
+// linked. Pure pass-through to the real glAttachShader plus bookkeeping.
+void glAttachShader_soloader(GLuint program, GLuint shader);
+
 void glShaderSource_soloader(GLuint shader, GLsizei count,
                              const GLchar **string, const GLint *_length);
 

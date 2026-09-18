@@ -65,6 +65,51 @@ static int shader_is_substituted(GLuint shader) {
     return 0;
 }
 
+// 2026-09-18: the generic gl_bind/gl_u4v/gl_u1i telemetry below (uloc_logged/
+// u4v_logged/u1i_logged) caps out (60/25/40 calls) well before the engine
+// ever reaches the MainCharacter/horse materials in a real session -- their
+// MULTITEXTURED+TEXTURESKINNED programs (confirmed #34-40 in
+// log_20260918_000157.txt, right after the Sampler1->unit-7 fix from the
+// prior session, which DID apply but did NOT fix the reported still-black
+// character/horse) never got a single [gl_bind]/[gl_u4v]/[gl_u1i] line, so
+// there is no evidence yet of what THIS specific material actually binds.
+// Flag shaders whose source contains both "MULTITEXTURED" and "SKINNED"
+// (matches SKINNED/QUATSKINNED/TEXTURESKINNED) in glShaderSource_soloader,
+// propagate shader->program via glAttachShader_soloader, and let the
+// telemetry functions below log unconditionally (bypassing their caps) for
+// just these specific watched programs -- targeted, not a blanket raise of
+// the caps (which would spam the log for the rest of a real session).
+#define MAX_WATCHED 16
+static GLuint s_watched_shaders[MAX_WATCHED];
+static int s_watched_shader_count;
+static GLuint s_watched_programs[MAX_WATCHED];
+static int s_watched_program_count;
+
+static void watch_shader(GLuint shader) {
+    for (int i = 0; i < s_watched_shader_count; i++) if (s_watched_shaders[i] == shader) return;
+    if (s_watched_shader_count < MAX_WATCHED) s_watched_shaders[s_watched_shader_count++] = shader;
+}
+static int shader_is_watched(GLuint shader) {
+    for (int i = 0; i < s_watched_shader_count; i++) if (s_watched_shaders[i] == shader) return 1;
+    return 0;
+}
+static void watch_program(GLuint program) {
+    for (int i = 0; i < s_watched_program_count; i++) if (s_watched_programs[i] == program) return;
+    if (s_watched_program_count < MAX_WATCHED) s_watched_programs[s_watched_program_count++] = program;
+}
+static int program_is_watched(GLuint program) {
+    for (int i = 0; i < s_watched_program_count; i++) if (s_watched_programs[i] == program) return 1;
+    return 0;
+}
+
+void glAttachShader_soloader(GLuint program, GLuint shader) {
+    if (shader_is_watched(shader)) {
+        watch_program(program);
+        l_info("[gl_watch] program %u <- watched shader %u (MULTITEXTURED+SKINNED)", program, shader);
+    }
+    glAttachShader(program, shader);
+}
+
 static void cleanup_corrupt_gxp(void) {
     SceUID dfd = sceIoDopen(DATA_PATH "gxp");
     if (dfd >= 0) {
@@ -175,6 +220,11 @@ void glShaderSource_soloader(GLuint shader, GLsizei count,
         }
     }
     str[total_length] = '\0';
+
+    if (strstr(str, "MULTITEXTURED") && strstr(str, "SKINNED")) {
+        watch_shader(shader);
+        l_info("[gl_watch] shader #%u flagged (MULTITEXTURED+SKINNED technique)", shader);
+    }
 
     // Empty shader sources (missing data/3d/effects/*.glsl + missing .obfs
     // fallback, served as 0 bytes via the FileStream::Tell/Seek NULL-FILE
@@ -429,8 +479,8 @@ static int interesting_uniform(const char *name) {
 
 GLint glGetUniformLocation_soloader(GLuint program, const GLchar *name) {
     GLint loc = glGetUniformLocation(program, name);
-    if (name && interesting_uniform(name) && uloc_logged < 60) {
-        uloc_logged++;
+    if (name && interesting_uniform(name) && (uloc_logged < 60 || program_is_watched(program))) {
+        if (!program_is_watched(program)) uloc_logged++;
         l_info("[gl_bind] prog=%u %s -> %d", program, name, loc);
     }
     return loc;
@@ -439,9 +489,11 @@ GLint glGetUniformLocation_soloader(GLuint program, const GLchar *name) {
 void glUniform4fv_soloader(GLint location, GLsizei count, const GLfloat *value) {
     // vec4 uploads are DiffuseColor / material colors / bone rows: log the
     // first ones per run (with current program for correlation) to catch a
-    // materialeo uploading black.
-    if (u4v_logged < 25 && value && count >= 1) {
-        u4v_logged++;
+    // materialeo uploading black. Watched programs (see watch_program())
+    // always log, uncapped -- the generic cap exhausts long before the
+    // character/horse materials link in a real session.
+    if (value && count >= 1 && (u4v_logged < 25 || program_is_watched(cur_program))) {
+        if (!program_is_watched(cur_program)) u4v_logged++;
         l_info("[gl_u4v] prog=%u loc=%d count=%d v=(%.3f,%.3f,%.3f,%.3f)",
                cur_program, location, count, value[0], value[1], value[2], value[3]);
     }
@@ -450,8 +502,8 @@ void glUniform4fv_soloader(GLint location, GLsizei count, const GLfloat *value) 
 
 void glUniform1i_soloader(GLint location, GLint v0) {
     // Sampler->unit assignments (+ BoneTexture unit for TEXTURESKINNED).
-    if (u1i_logged < 40) {
-        u1i_logged++;
+    if (u1i_logged < 40 || program_is_watched(cur_program)) {
+        if (!program_is_watched(cur_program)) u1i_logged++;
         l_info("[gl_u1i] prog=%u loc=%d unit=%d", cur_program, location, v0);
     }
     glUniform1i(location, v0);

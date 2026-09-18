@@ -3563,3 +3563,47 @@ Village/Savage/machang) + screenshot `screenshots/hj/2026-09-16/2026-09-16-20450
   personaje/caballo para confirmar si el fix de `Sampler1` resolvió el negro o si la limitación de
   skinning (bind pose sin animación, no cubierta por este fix) sigue siendo visible como un problema
   aparte.
+
+## Sesión 2026-09-18 — Confirmado en consola: L+R y joystick OK; personaje/caballo SIGUEN negros pese al fix de `Sampler1` -- telemetría dirigida agregada
+
+- **Reporte del usuario, con `logs/log_20260918_000157.txt`:** "Funciona bien excepto las texturas
+  siguen negras." Build stamp del log (`Sep 17 2026 22:43:41`) coincide exactamente con el build de la
+  sesión anterior (fix de `Sampler1` + combo L+R + `dim_movepad`), confirmando que lo que se probó es
+  el código correcto -- el usuario debe haber instalado el `.vpk`/`eboot` manualmente ya que el deploy
+  automático había fallado por FTP al final de esa sesión.
+- **El fix de `Sampler1` SÍ se aplicó, confirmado línea por línea:** `grep -n "Sampler1"` sobre el log
+  muestra `program_init] program 34/35/36/37/38/39/40: defaulted Sampler1 to empty unit 7` -- exactamente
+  los 7 programas `#define TEXTURED|#define MULTITEXTURED|...` (incluyendo `SKINNED`/`QUATSKINNED`/
+  `TEXTURESKINNED`, confirmado en las líneas `glShaderSource` inmediatamente anteriores) que corresponden
+  a los materiales de personaje/caballo. Sin embargo el negro persiste -- el fix era necesario pero no
+  suficiente: hay otra causa activa además de (o en vez de) el `tex1` al cuadrado.
+- **Por qué el log NO alcanza para diagnosticar la causa real:** la telemetría `[gl_bind]`/`[gl_u4v]`/
+  `[gl_u1i]` (`source/utils/glutil.c`) tiene topes fijos (`uloc_logged<60`, `u4v_logged<25`,
+  `u1i_logged<40`) pensados para no inundar el log en una sesión completa -- pero esos topes se agotan
+  MUCHO antes de llegar a los programas 34-40: `grep -n "prog=3[4-9]\|prog=40" log_20260918_000157.txt`
+  no devuelve NINGUNA línea. No es que el material no llame a estas funciones -- es que ya no queda cupo
+  de log cuando llega su turno. Cero visibilidad real de qué bindea (o deja de bindear) este material
+  específico.
+- **Fix de instrumentación (no un fix de gráficos todavía -- preparar el próximo diagnóstico con
+  evidencia real, no otra suposición):**
+  - `source/utils/glutil.c`: `glShaderSource_soloader()` ahora marca (`watch_shader()`) cualquier shader
+    cuyo source contenga TANTO `"MULTITEXTURED"` como `"SKINNED"` (cubre `SKINNED`/`QUATSKINNED`/
+    `TEXTURESKINNED` por substring) -- exactamente la familia de programas 34-40 de este log. Nueva
+    `glAttachShader_soloader()` (wireada en `source/dynlib.c`, reemplazando el mapeo directo a la función
+    real de vitaGL) propaga la marca de shader a programa vía `watch_program()` cuando el motor adjunta un
+    shader marcado a un programa.
+  - `glGetUniformLocation_soloader`/`glUniform4fv_soloader`/`glUniform1i_soloader`: ahora loguean SIN
+    tope para cualquier programa marcado (`program_is_watched()`/`program_is_watched(cur_program)`),
+    dejando los topes existentes intactos para todo lo demás -- no es subir el límite global (eso sí
+    inundaría el log en una sesión larga), es una excepción dirigida solo a los programas que de verdad
+    hace falta ver.
+- **Validación:** `psvita-toolkit build --preset debug` limpio (`nm` confirma `glAttachShader_soloader`/
+  `watch_shader`/`watch_program` en el `.elf`). `eboot.bin`/`sacredodyssey.vpk` regenerados y desplegados
+  con `psvita-toolkit deploy --eboot --yes` (FTP respondió esta vez).
+- **Pendiente (consola física):** repetir la escena del personaje/caballo y traer el log nuevo -- ahora
+  debería mostrar líneas `[gl_watch]` (confirmando qué shaders/programas se marcaron) seguidas de
+  `[gl_bind]`/`[gl_u4v]`/`[gl_u1i]` completas para esos programas específicos, sin importar cuántas otras
+  ya se hayan logueado antes. Con eso se podrá ver, por primera vez, qué le falta exactamente a este
+  material (¿`DiffuseColor` en 0,0,0,0 real? ¿`Sampler0` sin bindear a la unidad correcta? ¿otro uniform
+  tipo `envmapIntensity` que si aporta al color final, a diferencia de lo asumido?) en vez de seguir
+  adivinando sobre el mecanismo ya conocido de `tex1`.
