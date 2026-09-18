@@ -22,6 +22,21 @@ static uint32_t s_current_buttons = 0;
 // Global pointer to Hud::s_pInstance in libsacredodyssey.so
 static uintptr_t *s_hud_s_pInstance_ptr = NULL;
 
+// AnimObject::SetAlpha(int) -- __thiscall, `this` in r0 like any other ARM
+// AAPCS call. Symbol confirmed present (T, not just a UND JNI stub) via
+// `arm-vita-eabi-nm -C --defined-only libsacredodyssey.so` on all three
+// extracted copies of the real .so in this repo's working tree, at the same
+// mangled name regardless of the exact build's address -- same class of
+// lookup this file already relies on for _ZN3Hud11s_pInstanceE and the two
+// Get_MovePad_AxisValues hooks. Used to dim (not fully hide) the on-screen
+// virtual buttons the physical controls now duplicate: unlike HudWidget's
+// own "visible" flag (offset 0x18, HudWidget::SetVisible),
+// HudWidget::CollideTouchPoint() only gates hit-testing on offsets 0x18/0x19
+// (confirmed directly in its decompiled body) and never reads alpha, so
+// dimming via this call keeps real-touch AND our own synthetic taps working
+// on these buttons while making them visually unobtrusive.
+static void (*s_animobject_set_alpha)(uintptr_t anim_obj, int alpha) = NULL;
+
 // Touch slot manager (max 5 slots, strictly complying with psvita-porting input_handling reference)
 #define MAX_TOUCH_SLOTS 5
 static int s_slotHwId[MAX_TOUCH_SLOTS] = {-1, -1, -1, -1, -1};
@@ -101,14 +116,22 @@ static bool get_widget_pos(enum HudWidgetOffset offset, float *out_x, float *out
     return is_widget_active(widget, out_x, out_y);
 }
 
-// Force-hide a HUD widget (movement joystick):
-static void hide_widget(enum HudWidgetOffset offset) {
+// Dim a HUD widget's sprite alpha WITHOUT touching its visible/active flags,
+// so it stays fully touch-functional (see s_animobject_set_alpha's comment
+// above) while becoming visually unobtrusive now that physical controls
+// duplicate it. HudWidget::Activate/DeActivate (decompiled) confirm offset
+// +4 holds the widget's AnimObject* (`*(AnimObject **)(in_r0 + 4)`).
+#define DIM_ALPHA 18 // ~7% opacity (0-255 scale, confirmed via ASprite::SetAlpha/AnimObject::SetAlpha call sites using 0/0xff as the full range)
+static void dim_widget(enum HudWidgetOffset offset, int alpha) {
+    if (!s_animobject_set_alpha) return;
     if (!s_hud_s_pInstance_ptr || !*s_hud_s_pInstance_ptr) return;
     uintptr_t hud = *s_hud_s_pInstance_ptr;
     if (!hud || !is_plausible_ptr(hud)) return;
     uintptr_t widget = *(uintptr_t *)(hud + offset);
     if (!widget || !is_plausible_ptr(widget)) return;
-    *(uint8_t *)(widget + 0x18) = 0;
+    uintptr_t anim = *(uintptr_t *)(widget + 4);
+    if (!anim || !is_plausible_ptr(anim)) return;
+    s_animobject_set_alpha(anim, alpha);
 }
 
 // Hook for HudMovePad::Get_MovePad_AxisValues (Left Analog Stick & D-Pad)
@@ -229,6 +252,15 @@ void controls_init(so_touch_fn touch_fn, so_key_fn key_down_fn, so_key_fn key_up
     } else {
         l_warn("Could not resolve Hud::s_pInstance");
     }
+
+    // Resolve AnimObject::SetAlpha(int) for dim_widget() (see its comment).
+    uintptr_t set_alpha_sym = so_symbol(&so_mod, "_ZN10AnimObject8SetAlphaEi");
+    if (set_alpha_sym) {
+        s_animobject_set_alpha = (void (*)(uintptr_t, int))set_alpha_sym;
+        l_info("Resolved AnimObject::SetAlpha successfully");
+    } else {
+        l_warn("Could not resolve AnimObject::SetAlpha -- virtual buttons will stay fully opaque");
+    }
 }
 
 void controls_update(void) {
@@ -241,11 +273,24 @@ void controls_update(void) {
     uint32_t pressed = s_current_buttons & ~s_old_buttons;
     uint32_t released = ~s_current_buttons & s_old_buttons;
 
-    // Physical controls fully replace the on-screen virtual movement
-    // joystick (see hook_HudMovePad_Get_MovePad_AxisValues); its touch
-    // graphic is non-functional noise on a physical-control HUD, so keep it
-    // force-hidden every frame.
-    hide_widget(HUD_OFFSET_MOVEPAD);
+    // Physical controls now duplicate every on-screen virtual button
+    // (movement joystick + the action icons tapped synthetically below), so
+    // dim them every frame to declutter the HUD -- via alpha (dim_widget),
+    // NOT via the "visible" flag (hide_widget), so real touch and our own
+    // synthetic taps below both keep working (see dim_widget()'s comment).
+    dim_widget(HUD_OFFSET_MOVEPAD, DIM_ALPHA);
+    dim_widget(HUD_OFFSET_CAMERAPAD, DIM_ALPHA);
+    dim_widget(HUD_OFFSET_ATTACK, DIM_ALPHA);
+    dim_widget(HUD_OFFSET_SWORD, DIM_ALPHA);
+    dim_widget(HUD_OFFSET_DEFENSE, DIM_ALPHA);
+    dim_widget(HUD_OFFSET_BLOCK, DIM_ALPHA);
+    dim_widget(HUD_OFFSET_CHANGE_HORSE, DIM_ALPHA);
+    dim_widget(HUD_OFFSET_CHANGE_RUN, DIM_ALPHA);
+    dim_widget(HUD_OFFSET_TARGET_CROSS, DIM_ALPHA);
+    dim_widget(HUD_OFFSET_MINI_MAP, DIM_ALPHA);
+    dim_widget(HUD_OFFSET_SYS_IGM, DIM_ALPHA);
+    dim_widget(HUD_OFFSET_IGM, DIM_ALPHA);
+    dim_widget(HUD_OFFSET_SWITCH_WEAPON, DIM_ALPHA);
 
     // Menu Key Events:
     // START -> KEYCODE_BACK (4) / Menu

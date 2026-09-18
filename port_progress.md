@@ -3420,3 +3420,62 @@ Village/Savage/machang) + screenshot `screenshots/hj/2026-09-16/2026-09-16-20450
   el caballo. Si alguno sigue sin hacer nada, traer `log_*.txt` de esa corrida -- ahora debe mostrar la
   línea `[controls] ... tap (x, y)` exacta en el momento de presionar, lo que descarta o confirma
   definitivamente el mapeo como causa.
+
+## Sesión 2026-09-17 (cont.) — Confirmado en consola: los 8 botones físicos funcionan; atenuado el HUD virtual redundante y arreglado el cierre a LiveArea
+
+- **Reporte del usuario, con `logs/log_20260917_221304.txt`:** los 8 botones físicos ya funcionan como
+  se espera (confirmado en el propio log: `[controls] Triangle -> Horse tap (771, 446)`,
+  `Cross -> Attack tap (742, 353)`, `Circle -> Shield tap (633, 424)` disparándose exactamente en los
+  frames donde el usuario reportó haber presionado cada botón, con transiciones de estado normales
+  `MainMenu -> Loading -> Mission` en el medio) -- el fix de la sesión anterior (eliminar la consulta
+  dinámica a `get_widget_pos()` para estos 3 botones) quedó confirmado como la causa raíz real, no una
+  hipótesis. Dos pedidos nuevos:
+  1. Atenuar/ocultar el joystick virtual y los botones de acción en pantalla (ya redundantes con los
+     físicos), pero sin romper su funcionalidad -- ni la del propio touch real, ni la de los taps
+     sintéticos que generan los botones físicos -- sugiriendo opacidad o que el joystick visualmente seudo
+     el stick físico como alternativas.
+  2. Al cerrar el juego desde su menú no vuelve al LiveArea -- corregirlo para que sí lo haga.
+
+- **Botones de acción/joystick: por qué `hide_widget()` (usada hasta ahora solo para el movepad) no
+  servía para esto** -- se confirmó en el pseudo-C real de `HudWidget::CollideTouchPoint`
+  (`out_ghidra.c:28569`): el hit-test de touch de CUALQUIER widget retorna inmediatamente sin colisión si
+  `this[0x19]==0` (active) O `this[0x18]==0` (visible) -- es decir, la MISMA bandera que oculta el dibujo
+  también deshabilita su propio touch-hit-test. Poner `visible=0` en los botones de acción habría roto
+  tanto el touch real como nuestros propios taps sintéticos (que dependen de que el widget real bajo esa
+  coordenada SÍ registre el hit), justo lo que el usuario pidió evitar.
+  - **Mecanismo real usado -- alpha, no visibilidad:** `arm-vita-eabi-nm -C --defined-only` sobre las tres
+    copias reales del `.so` en este repo confirmó los símbolos `AnimObject::SetAlpha(int)` y
+    `ASprite::SetAlpha(int)` presentes (no solo declarados, con dirección real) en los tres builds. El
+    pseudo-C de `HudWidget::Activate`/`DeActivate` (`out_ghidra.c:28046-28112`) confirma que el offset
+    `+4` de todo `HudWidget` es un `AnimObject*` (`*(AnimObject **)(in_r0 + 4)`), y
+    `AnimObject::SetAlpha(int)` internamente llama `ASprite::SetAlpha((ASprite*)(this+0x2c), alpha)`
+    (`out_ghidra.c:72365-72370`) -- ninguna de las dos toca `visible`/`active`, así que atenuar por acá no
+    afecta el hit-test en absoluto (confirmado leyendo el propio `CollideTouchPoint`, que nunca lee
+    alpha).
+  - **Implementación (`source/controls.c`):** resuelto `_ZN10AnimObject8SetAlphaEi` en `controls_init()`
+    (mismo patrón ya probado para `_ZN3Hud11s_pInstanceE`/los dos hooks de axis). Nueva `dim_widget()`
+    (misma cadena de guardas `is_plausible_ptr` que `get_widget_pos`, sin las cuales sería el mismo tipo
+    de bug de puntero colgante ya confirmado 3 veces en este archivo) llamada cada frame con
+    `DIM_ALPHA=18` (~7% opacidad) sobre: `MOVEPAD`, `CAMERAPAD`, `ATTACK`, `SWORD`, `DEFENSE`, `BLOCK`,
+    `CHANGE_HORSE`, `CHANGE_RUN`, `TARGET_CROSS`, `MINI_MAP`, `SYS_IGM`, `IGM`, `SWITCH_WEAPON` -- todo lo
+    que ahora tiene un botón físico redundante. Los widgets contextuales que aparecen brevemente
+    (diálogo/cutscene/hablar con NPC/tesoro/bomba/caja/espejo/acción) NO se tocaron -- sin botón físico
+    dedicado, el jugador todavía necesita verlos para saber cuándo puede interactuar.
+    `hide_widget()` (ya sin ningún llamador tras este cambio) se eliminó en vez de dejarla como código
+    muerto.
+- **Cierre del juego no volvía al LiveArea -- causa confirmada en el propio log:** línea
+  `[Java] game requested Exit / sendAppToBackground (id=2)` repetida 3 veces sin que el proceso terminara
+  nunca -- `method_exit()` en `source/java.c` (el handler JNI real de `Exit`/`sendAppToBackground`, ver
+  `MID_EXIT` en la tabla de métodos) solo logueaba, nunca terminaba el proceso (a diferencia de Android,
+  donde `finish()` sí lo hace).
+  - **Fix (`source/java.c`):** `method_exit()` ahora llama `audio_shutdown()` (detiene limpiamente el
+    hilo/puerto de audio agregado esta misma sesión) y `sceKernelExitProcess(0)`, devolviendo el control
+    real al LiveArea, igual que el `finish()` de Android que este callback reemplaza.
+- **Validación:** `psvita-toolkit build --preset debug` limpio (`nm` confirma `dim_widget`/
+  `s_animobject_set_alpha`/`method_exit` presentes en el `.elf` final). `eboot.bin`/`sacredodyssey.vpk`
+  regenerados y sincronizados a la raíz. Desplegado con `psvita-toolkit deploy --eboot --yes` (FTP
+  respondió, subido a `ux0:/app/PSVSOTROA/eboot.bin`).
+- **Pendiente (consola física):** confirmar visualmente que el joystick y los botones de acción ahora se
+  ven tenues (no invisibles) en pantalla, que tocarlos directamente en la pantalla táctil real TODAVÍA
+  funciona (validación de que `dim_widget` no rompió el hit-test), y que salir del juego desde su menú
+  ahora sí vuelve al LiveArea en vez de quedarse congelado.

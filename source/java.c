@@ -47,7 +47,14 @@ static void method_play_video(jmethodID id, va_list args) {
 
 static void method_exit(jmethodID id, va_list args) {
     (void)args;
-    l_info("[Java] game requested Exit / sendAppToBackground (id=%d)", (int)id);
+    l_info("[Java] game requested Exit / sendAppToBackground (id=%d) -- exiting to LiveArea", (int)id);
+    // Real Android just finish()es the Activity here; on Vita that means
+    // actually terminating the process so the OS returns control to
+    // LiveArea, instead of the previous no-op that left the game frozen on
+    // its own exit-confirmation screen forever (confirmed in
+    // log_20260917_221304.txt: this line logged 3x with no process exit).
+    audio_shutdown();
+    sceKernelExitProcess(0);
 }
 
 static jobject object_dummy(jmethodID id, va_list args) {
