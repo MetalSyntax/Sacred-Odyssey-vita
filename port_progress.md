@@ -3375,3 +3375,48 @@ Village/Savage/machang) + screenshot `screenshots/hj/2026-09-16/2026-09-16-20450
   `[audio] first AudioTrack.write() call (...) -- Vox output path is alive` (aparecería en cuanto el
   splash empiece a precargar el catálogo de sonidos, mismo punto donde antes solo se veía el escaneo
   `fopen()` sin ningún log de audio) -- y, por supuesto, escuchar sonido real por primera vez.
+
+## Sesión 2026-09-17 (cont.) — Re-mapeo de Cruz/Círculo/Triángulo: la coordenada nunca fue el bug
+
+- **Reporte del usuario:** "Ese fix no servía" (el commit anterior con el fix de doble desreferenciación
+  de `Hud::s_pInstance`), pidiendo re-mapear los tres botones con
+  `screenshots/hj/2026-09-16/2026-09-16-204503.jpg` como referencia.
+- **Remedición precisa del screenshot** (no a ojo esta vez): overlay de grilla de 40px +
+  un paso de segmentación por color (máscara de "anillo dorado", `numpy`/`PIL`) sobre la imagen real
+  (960x544) para ubicar el centro exacto de cada ícono, convertido al espacio del engine (800x480) con
+  el MISMO factor de escala lineal que ya aplican `glViewport_soloader`/`glScissor_soloader`
+  (`x*800/960`, `y*480/544`):
+  - Ícono de espada/ataque (abajo-derecha): screenshot `(890,400)` -> engine `(742,353)`.
+  - Ícono de escudo (abajo, centro-derecha): screenshot `(760,480)` -> engine `(633,424)`.
+  - Ícono de caballo (esquina abajo-derecha): screenshot `(925,505)` -> engine `(771,446)`.
+- **Hallazgo clave: las coordenadas de fallback de la sesión anterior (`740,360`/`630,425`/`775,452`)
+  YA estaban correctas** (a un puñado de píxeles de esta remedición independiente) -- la posición nunca
+  fue la causa del bug reportado. Descartada esa hipótesis con evidencia, no solo por sospecha.
+- **Causa raíz más probable (no confirmable sin log nuevo, pero consistente con evidencia ya
+  documentada tres veces en este mismo archivo):** `get_widget_pos()` sigue consultando dinámicamente
+  otros slots del array de widgets de `Hud` (`button_action`/`button_attack`/`button_defense`/
+  `button_ChangeToHorse`/etc.) antes de caer al fallback fijo. Si CUALQUIERA de esos slots devuelve
+  "visible"/"active" en `true` por basura persistente de una transición de HUD anterior -- exactamente
+  la misma familia de bug de puntero colgante ya confirmada tres veces en `is_plausible_ptr()` (ver
+  Fase 8 cont. sesión 2026-09-15 noche, y las dos entradas de 2026-09-16) -- el tap termina en la
+  posición de ESE widget en vez de en el ícono real, y como esas posiciones basura normalmente no caen
+  sobre ningún ícono tocable, el botón "no hace nada".
+- **Fix (`source/controls.c`):** para Cruz/Círculo/Triángulo específicamente, se ELIMINÓ por completo la
+  consulta dinámica a `get_widget_pos()` -- ahora usan SIEMPRE las coordenadas fijas remedidas arriba
+  (`BTN_ATTACK_X/Y`, `BTN_SHIELD_X/Y`, `BTN_HORSE_X/Y`), sin ninguna rama de override. Justificación:
+  estos tres íconos son HUD estático (nunca se mueven ni desaparecen en gameplay normal, confirmado por
+  el mismo screenshot) -- la consulta dinámica no aportaba nada aquí y sí heredaba toda la fragilidad ya
+  demostrada del array de widgets. Cuadrado/L-Trigger/R-Trigger/Select NO se tocaron (no reportados como
+  rotos, fuera de alcance de esta pasada).
+- **Diagnóstico agregado:** log `l_info("[controls] Cross/Circle/Triangle -> ... tap (x, y)")` en el
+  flanco de subida (`pressed & SCE_CTRL_*`, una vez por pulsación, no por frame) -- si el problema
+  persiste tras este cambio, el próximo log dirá con certeza qué coordenada se tocó, permitiendo
+  triangular si el problema está río abajo (p.ej. en `appOnTouch`/el gate `MenuState::IsFinished()` ya
+  documentado en la sesión de investigación de táctil de 2026-09-16 madrugada) en vez de en el mapeo.
+- **Validación:** `psvita-toolkit build --preset debug` limpio. `eboot.bin`/`sacredodyssey.vpk`
+  regenerados y sincronizados a la raíz. Desplegado con `psvita-toolkit deploy --eboot --yes` (FTP
+  respondió esta vez, subido a `ux0:/app/PSVSOTROA/eboot.bin`).
+- **Pendiente (consola física):** confirmar que Cruz ataca, Círculo defiende y Triángulo monta/desmonta
+  el caballo. Si alguno sigue sin hacer nada, traer `log_*.txt` de esa corrida -- ahora debe mostrar la
+  línea `[controls] ... tap (x, y)` exacta en el momento de presionar, lo que descarta o confirma
+  definitivamente el mapeo como causa.

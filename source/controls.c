@@ -277,50 +277,66 @@ void controls_update(void) {
 
     // 2. Physical Button to Virtual Widget mappings (using stable negative IDs):
     // Scheme:
-    // CROSS (X)    = Sword Attack (contextual interact fallback when active)
-    // CIRCLE       = Shield / Defense (never opens menu)
+    // CROSS (X)    = Sword Attack (fixed coordinate, no dynamic override)
+    // CIRCLE       = Shield / Defense (fixed coordinate, no dynamic override)
     // SQUARE       = Minimap (lower down on right side, never top-right sword)
-    // TRIANGLE     = Horse (bottom-right corner)
+    // TRIANGLE     = Horse (fixed coordinate, no dynamic override)
     // L-TRIGGER    = Shield / Defense or Target Lock
     // R-TRIGGER    = Horse
     // SELECT       = Weapon Switch / In-Game Menu (top-right corner)
 
-    // CROSS (X): Sword Attack, with contextual interaction priority
-    // (dialog advance, cutscene skip, talk to NPC, treasure, bomb, push box,
-    // mirror) when active; otherwise sword attack.
+    // CROSS/CIRCLE/TRIANGLE fixed engine-space (800x480) coordinates,
+    // remeasured directly off screenshots/hj/2026-09-16/2026-09-16-204503.jpg
+    // (960x544 real framebuffer) with a 40px reference grid overlay + a
+    // gold-ring color-mask centroid pass, then converted with the SAME
+    // linear 800/960, 480/544 stretch glViewport_soloader/glScissor_soloader
+    // already apply engine-side (see source/utils/glutil.c) -- not a guess:
+    //   Attack (flame sword, bottom-right): screenshot (890,400) -> (742,353)
+    //   Shield (wave shield, bottom-center-right): screenshot (760,480) -> (633,424)
+    //   Horse (bottom-right corner): screenshot (925,505) -> (771,446)
+    // These match (within a few px) the previous session's fallback values,
+    // confirming the COORDINATES were never the bug. The actual, previously
+    // untested bug: get_widget_pos()'s dynamic override could silently steal
+    // the tap away from these confirmed-correct spots whenever some OTHER
+    // HudWidget slot in the same Hud table (button_action/button_attack/
+    // button_defense/button_ChangeToHorse/...) reads back "visible"/"active"
+    // stale-true from a leftover HUD-transition write -- the exact same class
+    // of dangling-widget-table bug already confirmed THREE times over in this
+    // file's own history (is_plausible_ptr's own comment trail). Since these
+    // three icons are static HUD chrome (they never move or disappear during
+    // normal gameplay, confirmed by this same screenshot), the dynamic lookup
+    // buys nothing here but inherits all of that fragility -- removed
+    // entirely for these three; SQUARE/L-TRIGGER/R-TRIGGER/SELECT keep it
+    // (not reported broken, out of scope for this pass).
+    #define BTN_ATTACK_X 742.0f
+    #define BTN_ATTACK_Y 353.0f
+    #define BTN_SHIELD_X 633.0f
+    #define BTN_SHIELD_Y 424.0f
+    #define BTN_HORSE_X  771.0f
+    #define BTN_HORSE_Y  446.0f
+
+    // CROSS (X): Sword Attack.
     if (g_pad.buttons & SCE_CTRL_CROSS) {
-        float x = 740.0f, y = 360.0f;
-        if (!get_widget_pos(HUD_OFFSET_TUTORIAL_DLG, &x, &y) &&
-            !get_widget_pos(HUD_OFFSET_CUTSCENE, &x, &y) &&
-            !get_widget_pos(HUD_OFFSET_TALK_NPC, &x, &y) &&
-            !get_widget_pos(HUD_OFFSET_OPEN_TREASURE, &x, &y) &&
-            !get_widget_pos(HUD_OFFSET_PICK_BOMB, &x, &y) &&
-            !get_widget_pos(HUD_OFFSET_PUSH_BOX, &x, &y) &&
-            !get_widget_pos(HUD_OFFSET_ROTATE_MIRROR, &x, &y) &&
-            !get_widget_pos(HUD_OFFSET_ACTION, &x, &y) &&
-            !get_widget_pos(HUD_OFFSET_ATTACK, &x, &y) &&
-            !get_widget_pos(HUD_OFFSET_SWORD, &x, &y)) {
-            x = 740.0f; y = 360.0f;
+        if (pressed & SCE_CTRL_CROSS) {
+            l_info("[controls] Cross -> Attack tap (%.0f, %.0f)", BTN_ATTACK_X, BTN_ATTACK_Y);
         }
         if (num_reports < MAX_REPORTS) {
             reports[num_reports].id = -2; // Virtual ID for Cross
-            reports[num_reports].x = (int)x;
-            reports[num_reports].y = (int)y;
+            reports[num_reports].x = (int)BTN_ATTACK_X;
+            reports[num_reports].y = (int)BTN_ATTACK_Y;
             num_reports++;
         }
     }
 
-    // CIRCLE: Defense / Shield in gameplay (never opens menu)
+    // CIRCLE: Defense / Shield (never opens menu).
     if (g_pad.buttons & SCE_CTRL_CIRCLE) {
-        float x = 630.0f, y = 425.0f;
-        if (!get_widget_pos(HUD_OFFSET_DEFENSE, &x, &y) &&
-            !get_widget_pos(HUD_OFFSET_BLOCK, &x, &y)) {
-            x = 630.0f; y = 425.0f;
+        if (pressed & SCE_CTRL_CIRCLE) {
+            l_info("[controls] Circle -> Shield tap (%.0f, %.0f)", BTN_SHIELD_X, BTN_SHIELD_Y);
         }
         if (num_reports < MAX_REPORTS) {
             reports[num_reports].id = -5; // Virtual ID for Circle Shield
-            reports[num_reports].x = (int)x;
-            reports[num_reports].y = (int)y;
+            reports[num_reports].x = (int)BTN_SHIELD_X;
+            reports[num_reports].y = (int)BTN_SHIELD_Y;
             num_reports++;
         }
     }
@@ -339,17 +355,15 @@ void controls_update(void) {
         }
     }
 
-    // TRIANGLE: Mount / Dismount Horse (bottom-right corner)
+    // TRIANGLE: Mount / Dismount Horse.
     if (g_pad.buttons & SCE_CTRL_TRIANGLE) {
-        float x = 775.0f, y = 452.0f;
-        if (!get_widget_pos(HUD_OFFSET_CHANGE_HORSE, &x, &y) &&
-            !get_widget_pos(HUD_OFFSET_CHANGE_RUN, &x, &y)) {
-            x = 775.0f; y = 452.0f;
+        if (pressed & SCE_CTRL_TRIANGLE) {
+            l_info("[controls] Triangle -> Horse tap (%.0f, %.0f)", BTN_HORSE_X, BTN_HORSE_Y);
         }
         if (num_reports < MAX_REPORTS) {
             reports[num_reports].id = -4; // Virtual ID for Triangle
-            reports[num_reports].x = (int)x;
-            reports[num_reports].y = (int)y;
+            reports[num_reports].x = (int)BTN_HORSE_X;
+            reports[num_reports].y = (int)BTN_HORSE_Y;
             num_reports++;
         }
     }
