@@ -120,11 +120,11 @@ enum HudWidgetOffset {
     HUD_OFFSET_CUTSCENE      = 80,  // HUD_CutScene
     HUD_OFFSET_CHANGE_HORSE  = 88,  // button_ChangeToHorse
     HUD_OFFSET_CHANGE_RUN    = 92,  // button_ChangeToRun
-    HUD_OFFSET_HEALTH_GROUP  = 96,  // status_healthGroup
+    HUD_OFFSET_HEALTH_GROUP  = 96,  // status_healthGroup (health bar at x=112, y=24)
     HUD_OFFSET_TUTORIAL_DLG  = 104, // button_HudTurtorialDialogInGame
     HUD_OFFSET_MINI_MAP      = 108, // Mini_Map
-    HUD_OFFSET_SYS_IGM       = 112, // button_toSysIGM
-    HUD_OFFSET_IGM           = 116, // button_toIGM
+    HUD_OFFSET_SYS_IGM       = 112, // button_toSysIGM (pause / system menu button at x=20, y=77)
+    HUD_OFFSET_IGM           = 116, // button_toIGM (Ayden circular portrait at x=25, y=22, opens in-game menu)
 };
 
 // Guard against dangling/garbage pointers in the Hud widget table.
@@ -197,12 +197,24 @@ static bool get_widget_pos(enum HudWidgetOffset offset, float *out_x, float *out
 // perceptible/depurable en pantalla).
 #define DIM_ALPHA 3 // ~1% opacity (0-255 scale, confirmed via ASprite::SetAlpha/AnimObject::SetAlpha call sites using 0/0xff as the full range)
 static int8_t s_dim_logged[128] = {0}; // 0=not yet logged, 1=logged-resolved, 2=logged-unresolved
+static uintptr_t s_dim_logged_hud = 0; // Hud instance the latch above belongs to (see below)
 static void dim_widget(enum HudWidgetOffset offset, int alpha) {
     bool resolved = false;
     uintptr_t anim = 0;
 
     if (s_hud_s_pInstance_ptr && *s_hud_s_pInstance_ptr) {
         uintptr_t hud = *s_hud_s_pInstance_ptr;
+        // 2026-09-20 (log_20260920_170443.txt): el motor reconstruye la tabla
+        // de widgets al cambiar de estado (Splash/Menu/Loading/Mission) -- el
+        // latch de s_dim_logged quedaba fijado con el layout del PRIMER Hud
+        // (casi todo "NOT resolved" en splash) y nunca re-reportaba en
+        // mision, ocultando que layout corre en gameplay real. Se resetea el
+        // latch cada vez que cambia la instancia de Hud (solo el log; el
+        // alpha se sigue aplicando cada frame igual que antes).
+        if (hud != s_dim_logged_hud) {
+            memset(s_dim_logged, 0, sizeof(s_dim_logged));
+            s_dim_logged_hud = hud;
+        }
         if (hud && is_plausible_ptr(hud)) {
             uintptr_t widget = *(uintptr_t *)(hud + offset);
             if (widget && is_plausible_ptr(widget)) {
@@ -277,8 +289,13 @@ static uintptr_t force_widget_shown(enum HudWidgetOffset offset) {
 // FindWidgetByName encuentra "health_bg"/"health" o no -- de eso depende el
 // siguiente paso (nombre incorrecto vs. otra causa).
 static int8_t s_named_child_logged[4] = {0};
+static uintptr_t s_named_child_logged_parent = 0; // parent the latch belongs to (reset per Hud rebuild, igual que s_dim_logged)
 static void force_named_child_shown(uintptr_t parent_widget, const char *name) {
     if (!parent_widget || !is_plausible_ptr(parent_widget) || !s_hudwidget_find_widget_by_name) return;
+    if (parent_widget != s_named_child_logged_parent) {
+        memset(s_named_child_logged, 0, sizeof(s_named_child_logged));
+        s_named_child_logged_parent = parent_widget;
+    }
     uintptr_t child = s_hudwidget_find_widget_by_name(parent_widget, name);
 
     int idx = (strcmp(name, "health_bg") == 0) ? 0 : 1;
@@ -319,6 +336,48 @@ static void dim_movepad(int alpha) {
             uintptr_t knob_anim = *(uintptr_t *)(knob + 4);
             if (knob_anim && is_plausible_ptr(knob_anim)) s_animobject_set_alpha(knob_anim, alpha);
         }
+    }
+}
+
+// 2026-09-20 (log_20260920_170443.txt): "sigue sin aparecer el retrato a
+// menos que haga aparecer todos los controles" (L+R). Ese log prueba que
+// health_bg/health SI se encuentran y se fuerzan (visible+active+alpha 255)
+// cada frame... y aun asi el retrato no se ve en reposo. Pero L+R SOLO
+// cambia el alpha de la lista atenuada (dim_widget con hud_alpha) -- lista
+// en la que health_bg/health NO estan. Conclusion: la opacidad final del
+// retrato depende de un widget DE LA LISTA ATENUADA -- o el mapa
+// offset->nombre (verificado contra UN solo layout de InitHudWidgets) no
+// vale en el Hud de mision y algun slot atenuado contiene arte del
+// retrato, o dos slots comparten el mismo AnimObject (atenuar uno atenua
+// ambos). En vez de adivinar cual, se vuelca la tabla COMPLETA (32 slots:
+// puntero, visible, active, posicion con la misma formula de
+// is_widget_active, y AnimObject) una vez por cada instancia distinta de
+// Hud -- con eso el proximo log muestra de frente que slot esta en la
+// posicion del retrato (arriba-izquierda) y si algun AnimObject esta
+// compartido. Solo diagnostico (l_info, debug-gated); no toca estado.
+static uintptr_t s_dumped_hud[8] = {0};
+static void dump_hud_table(uintptr_t hud) {
+    if (!hud || !is_plausible_ptr(hud)) return;
+    for (int i = 0; i < 8; i++) {
+        if (s_dumped_hud[i] == hud) return; // ya volcado
+    }
+    for (int i = 0; i < 7; i++) s_dumped_hud[i] = s_dumped_hud[i + 1];
+    s_dumped_hud[7] = hud;
+    l_info("[controls] hud_table dump (instance=0x%08x):", (unsigned int)hud);
+    for (int off = 0; off < 128; off += 4) {
+        uintptr_t widget = *(uintptr_t *)(hud + off);
+        if (!widget || !is_plausible_ptr(widget)) {
+            l_info("[controls] hud_table: off=%d empty", off);
+            continue;
+        }
+        uint8_t vis = *(uint8_t *)(widget + 0x18);
+        uint8_t act = *(uint8_t *)(widget + 0x19);
+        float x = *(float *)(widget + 0xdc) + *(float *)(widget + 0x114);
+        float y = *(float *)(widget + 0xe0) + *(float *)(widget + 0x118);
+        uintptr_t anim = *(uintptr_t *)(widget + 4);
+        if (!anim || !is_plausible_ptr(anim)) anim = 0;
+        l_info("[controls] hud_table: off=%d ptr=0x%08x vis=%u act=%u x=%.0f y=%.0f anim=0x%08x",
+               off, (unsigned int)widget, vis, act, x, y, (unsigned int)anim);
     }
 }
 
@@ -552,6 +611,13 @@ void controls_update(void) {
         s_cam_stick_deflected = (rx * rx + ry * ry) > (0.12f * 0.12f);
     }
 
+    // Volcado diagnostico de la tabla de widgets (una vez por instancia
+    // de Hud -- ver dump_hud_table()): con que instancia correr no importa,
+    // la funcion misma filtra repetidos.
+    if (s_hud_s_pInstance_ptr && *s_hud_s_pInstance_ptr) {
+        dump_hud_table(*s_hud_s_pInstance_ptr);
+    }
+
     // L+R combo (both bumpers held together, edge-triggered so holding them
     // doesn't flicker every frame) toggles the dimmed virtual HUD back to
     // full opacity -- user-requested way to see (or touch-tap directly) the
@@ -586,7 +652,10 @@ void controls_update(void) {
     dim_widget(HUD_OFFSET_CHANGE_HORSE, hud_alpha);
     dim_widget(HUD_OFFSET_CHANGE_RUN, hud_alpha);
     dim_widget(HUD_OFFSET_TARGET_CROSS, hud_alpha);
-    dim_widget(HUD_OFFSET_IGM, hud_alpha);
+    // 2026-09-20: HUD_OFFSET_IGM (offset 116, button_toIGM) removido de esta
+    // lista atenuada -- ver explicacion detallada mas abajo junto a
+    // force_widget_shown(HUD_OFFSET_IGM). Era el motivo exacto por el cual
+    // el retrato de Ayden quedaba a ~1% de opacidad (invisible) en reposo.
     // 2026-09-20 (usuario, log_20260920_000922.txt): "agregaste una espada...
     // no era agregarla sino ponerle la opacidad completa" -- HUD_OFFSET_SWORD
     // (offset 56, "button_sword") resultó ser un widget que el motor NO
@@ -640,6 +709,20 @@ void controls_update(void) {
     force_named_child_shown(health_group_widget, "health");
     force_widget_shown(HUD_OFFSET_MINI_MAP);
     force_widget_shown(HUD_OFFSET_SYS_IGM);
+    // 2026-09-20 (usuario, log_20260920_172216.txt): "el icono al lado de la
+    // salud sigue invisible" -- el volcado diagnostico de hud_table en ese
+    // log (instancia 0x89e5d5f8) probo definitivamente que en mision real:
+    //   - status_healthGroup (offset 96) esta en x=112, y=24 (barra de vida).
+    //   - button_toSysIGM (offset 112) esta en x=20, y=77 (boton de pausa).
+    //   - button_toIGM (offset 116) esta en x=25, y=22 con AnimObject 0x8a5aff60.
+    // La posicion (25, 22) es exactamente el retrato circular de Ayden al
+    // lado de la vida (112, 24) y sobre el boton de pausa (20, 77). En
+    // versiones previas estaba en la lista de dim_widget(..., hud_alpha),
+    // por lo que cada frame se atenuaba a DIM_ALPHA (3, ~1% de opacidad),
+    // haciendolo invisible a menos que se presionara L+R. Forzarlo visible,
+    // activo y a alpha=255 aqui resuelve definitivamente su visibilidad en
+    // reposo, tal como los otros widgets permanentes del HUD.
+    force_widget_shown(HUD_OFFSET_IGM);
     // 2026-09-20 (usuario): la espada real (button_switchWeapon, ver el
     // comentario junto a HUD_OFFSET_SWORD mas arriba) SI se renderiza en
     // gameplay normal (por eso alpha=255 solo alcanza, sin necesitar

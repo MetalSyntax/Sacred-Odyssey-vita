@@ -18,10 +18,12 @@ underneath it.
   - L+R combo: reveals the full virtual HUD at full opacity (to inspect or directly touch any icon,
     including the ones that stay dimmed during normal gameplay).
 - **HUD reorganized for console play:** the icons the original touchscreen UI showed all at once
-  (designed for fingers, not a controller) are dimmed during normal gameplay, except for the ones that
-  remain relevant information at all times: minimap, character portrait/health, menu icon, and the
-  weapon-switch icon. The rest of the icons stay touchable (for anyone who prefers playing via the
-  touchscreen), just visually more subtle.
+  (designed for fingers, not a controller) are dimmed to nearly invisible (~1% opacity) during
+  normal gameplay, except for the ones that remain relevant information at all times: minimap,
+  character portrait/health (`button_toIGM` and `status_healthGroup`), menu icon (`button_toSysIGM`),
+  and the weapon-switch icon (`button_switchWeapon`), which remain permanently visible at full opacity.
+  The rest of the icons stay touchable (for anyone who prefers playing via the touchscreen), just visually
+  in the background.
 - **Black-texture fix** on the character and mount (`MULTITEXTURED` materials): the second texture on
   those materials is an additive reflection (envmap) map, not a multiplicative detail layer as an
   earlier pass had assumed — the embedded shader now handles it correctly.

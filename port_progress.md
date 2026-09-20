@@ -4085,3 +4085,68 @@ Tres pedidos del usuario en un pase, un fix cada uno (compilación limpia desde 
   script en vez del `.array`) -- traer un log nuevo con
   `grep -c "force_named_child_shown\|FindWidgetByName"` no sirve (no logea por diseño, ver código);
   mejor pedir una captura de pantalla para confirmar visualmente antes de seguir iterando a ciegas.
+
+## Sesión 2026-09-20 (tercera vuelta) — `log_20260920_170443.txt`: health_bg/health SÍ se fuerzan y aun así el retrato no se ve; el L+R delata que su alpha depende de la lista atenuada
+
+- **Reporte del usuario:** "sigue sin aparecer el retrato a menos que haga aparecer todos los
+  controles que estamos ocultando" (L+R). Build de la corrida (`eboot build stamp: Sep 20 2026
+  16:27:39`): YA trae `force_named_child_shown()` con su logging (o sea, posterior al fix de la
+  "segunda vuelta", anterior solo al ajuste DIM_ALPHA 40->3 del commit `e63a743` -- irrelevante para
+  este bug, el retrato se fuerza a 255 en ambos).
+- **Evidencia decisiva en el propio log (líneas 6605-6609, transición Loading->Mission):**
+  - `force_named_child_shown(name=health_bg): found, visible+active+alpha forced` y lo mismo para
+    `health` -- los hijos SE encuentran y se fuerzan cada frame. La hipótesis de la sesión anterior
+    ("nombre de hijo incorrecto") queda DESCARTADA por evidencia.
+  - `dim_widget(offset=96)` (HEALTH_GROUP): NOT resolved -- el grupo no tiene AnimObject propio
+    (esperable), su forzado visible/active sí aplica si el puntero resuelve.
+  - `dim_widget(offset=112)` (SYS_IGM, menú): resolved -- consistente con "veo el menu".
+  - El usuario además usó L+R 6 veces al final de la sesión (líneas 6759-6838), confirmando que con
+    opacidad completa el retrato SÍ aparece.
+- **Razonamiento (sin adivinar):** L+R SOLO cambia `hud_alpha` (255 vs DIM_ALPHA) aplicado a la
+  lista atenuada de `dim_widget()` -- lista en la que health_bg/health NO están (se fuerzan a 255
+  siempre, por fuera de esa lista). Si el retrato aparece con L+R, su opacidad final DEPENDE de un
+  widget de la lista atenuada. Candidatos: (a) el mapa offset->nombre (verificado contra UN solo
+  layout de `InitHudWidgets`) no vale en el Hud de misión y algún slot atenuado contiene arte del
+  retrato; (b) dos slots comparten el mismo AnimObject (atenuar uno atenúa ambos). Lo que NO se
+  hace: otro parche a ciegas sobre offsets.
+- **Instrumentación agregada (`source/controls.c`, solo diagnóstico, cero cambio de
+  comportamiento):**
+  - `dump_hud_table()`: vuelca los 32 slots (offset, puntero, visible, active, x/y con la misma
+    fórmula de `is_widget_active()`, puntero AnimObject) una vez por cada instancia distinta de
+    `Hud::s_pInstance`, llamada desde `controls_update()`. El `anim=` por slot detecta de frente
+    AnimObjects compartidos entre slots.
+  - Resets por instancia: `s_dim_logged` se resetea cuando cambia la instancia de Hud (antes
+    quedaba fijado con el layout del primer Hud en splash, casi todo "NOT resolved", y nunca
+    re-reportaba en misión); `s_named_child_logged` igual cuando cambia el widget padre.
+- **Validación:** `psvita-toolkit build --preset debug` limpio (`nm` confirma `dump_hud_table`/
+  `s_dumped_hud`/`s_dim_logged_hud` en el `.elf`). `eboot.bin`/`sacredodyssey.vpk` regenerados y
+  copiados a la raíz.
+- **Pendiente (consola física):** `deploy --eboot`, entrar a misión (donde el retrato debería
+  verse) SIN tocar L+R, traer el log. Qué buscar: bloque `[controls] hud_table dump` de la
+  instancia de misión -- qué offset tiene un widget en la zona del retrato (arriba-izquierda) y si
+  ese offset está en la lista atenuada o comparte `anim=` con un slot atenuado. Con eso el fix es
+  directo (sacar ese slot de la lista dim o forzarlo a 255) en vez de seguir iterando sobre
+  health_bg.
+
+## Sesión 2026-09-20 (cuarta vuelta) — `log_20260920_172216.txt`: diagnóstico confirmado; el retrato es `button_toIGM` (offset 116), atenuado a 1% por dim_widget
+
+- **Reporte del usuario:** "'/Volumes/Seagate/PSVITA Develop/Sacred-Odyssey-vita/logs/log_20260920_172216.txt' el icono al lado de la salud sigue invisible".
+- **Evidencia decisiva en el log (`log_20260920_172216.txt`, instancia Hud `0x89e5d5f8`):**
+  - El volcado de `dump_hud_table` arrojó las coordenadas reales de cada widget en misión:
+    ```
+    off=96  ptr=0x888fa4b0 vis=1 act=1 x=112 y=24 anim=0x00000000 (status_healthGroup, barra de vida)
+    off=112 ptr=0x88cd4960 vis=1 act=1 x=20  y=77 anim=0x8a5b05c0 (button_toSysIGM, botón de pausa debajo)
+    off=116 ptr=0x888fa9f8 vis=1 act=1 x=25  y=22 anim=0x8a5aff60 (button_toIGM, retrato al lado de vida!)
+    ```
+  - `status_healthGroup` (offset 96) está en x=112, y=24.
+  - El widget en x=25, y=22 (inmediatamente a la izquierda de la barra de vida, y arriba del botón de pausa en y=77) es **offset 116** (`button_toIGM`, con `AnimObject` propio `0x8a5aff60`).
+  - En el juego original, el retrato circular de Ayden funciona simultáneamente como botón táctil para abrir el In-Game Menu (estado del personaje/inventario), de ahí el nombre `button_toIGM`.
+  - El log mostró la causa exacta:
+    `[INFO] [controls] dim_widget(offset=116): widget/AnimObject resolved, alpha applied`
+    donde `dim_widget(HUD_OFFSET_IGM, hud_alpha)` se llamaba en reposo con `DIM_ALPHA = 3` (~1% de opacidad), dejando el retrato 99% transparente.
+  - Al presionar L+R, `hud_alpha` pasaba a 255 y por eso el retrato aparecía. Al soltar, volvía a atenuarse a 3.
+- **Fix (`source/controls.c`):**
+  - Removido `HUD_OFFSET_IGM` de la lista de widgets atenuados por `dim_widget(..., hud_alpha)`.
+  - Agregado `force_widget_shown(HUD_OFFSET_IGM);` al bloque de widgets permanentes a opacidad completa (visible=1, active=1, alpha=255), junto a `status_healthGroup`, `button_toSysIGM`, `Mini_Map` y `button_switchWeapon`.
+- **Validación:** build con `psvita-toolkit build --preset debug`. Binarios regenerados y listos para consola.
+
