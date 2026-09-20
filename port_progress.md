@@ -3607,3 +3607,481 @@ Village/Savage/machang) + screenshot `screenshots/hj/2026-09-16/2026-09-16-20450
   material (¿`DiffuseColor` en 0,0,0,0 real? ¿`Sampler0` sin bindear a la unidad correcta? ¿otro uniform
   tipo `envmapIntensity` que si aporta al color final, a diferencia de lo asumido?) en vez de seguir
   adivinando sobre el mecanismo ya conocido de `tex1`.
+
+## Sesión 2026-09-18 (continuación) — Análisis de `logs/log_20260918_011317.txt`: textura negra (evidencia nueva, sin fix aún), freeze de stage y fcache sin eviction (SÍ arreglado)
+
+Pedido del usuario: reparar texturas en negro, el freeze al pasar de un stage a otro, y optimizar la
+velocidad de las pantallas de carga. Los tres se investigaron cruzando el log real contra el código --
+disciplina de esta skill, nada a ciegas.
+
+### 1) Texturas negras -- la telemetría `[gl_bind]`/`[gl_u4v]`/`[gl_u1i]` de la sesión anterior SÍ llegó a los programas 34-40, y prueba algo nuevo
+
+- `grep -n "gl_watch\|gl_bind\|gl_u4v\|gl_u1i"` contra el log confirma que el fix de instrumentación de
+  la sesión anterior funcionó: los programas 34-40 (familia `MULTITEXTURED|SKINNED|QUATSKINNED|
+  TEXTURESKINNED`, confirmado por los `#define` reales en `glShaderSource`) se marcaron y su
+  `program_init` corrió (`defaulted Sampler1 to empty unit 7` para los 7). Programas 38/39 incluso
+  resuelven `Sampler1` por `glGetUniformLocation` (`[gl_bind] prog=38 Sampler1 -> ...`).
+- **Hallazgo nuevo (no reportado antes):** en NINGÚN punto de la sesión completa (splash, mainmenu, dos
+  misiones, vuelta a mainmenu) aparece una sola línea `[gl_u4v]`/`[gl_u1i]` con `prog>=17` -- es decir,
+  el motor JAMÁS llama `glUniform4fv`/`glUniform1i` para NINGÚN programa de esta familia, ni una vez,
+  pese a que el personaje/caballo SÍ se dibujan en pantalla (silueta con forma correcta, confirmado por
+  el usuario en sesiones previas). Esto es más grave que "un parámetro con nombre distinto" (`Sampler1`
+  vs `Map__3__..._-sampler`, ya diagnosticado): significa que el paso de bind-parámetros del motor
+  (`CMaterialRendererManager`/`autoAddAndBindParameter`, mismo código de la Fase 2b/crash `1789184124`)
+  nunca llega a tocar `DiffuseColor` NI `Sampler0` para este material -- aunque `DiffuseColor` SÍ resuelve
+  su location por nombre (`[gl_bind] prog=38 DiffuseColor -> ...`), nunca se le hace `glUniform4fv`.
+  Tampoco hay `size mismatch` cerca (se buscó explícitamente) que explique un abort temprano del loop de
+  bind. La causa exacta de por qué el binder nunca llega a las llamadas `glUniform*` para este material
+  sigue sin confirmarse.
+- **Instrumentación nueva (`source/utils/glutil.c`, `source/dynlib.c`) -- diagnóstico, no un fix a
+  ciegas:** la telemetría pasiva (observar los `glUniform*` que el motor llama) se agotó sin evidencia
+  para este material específico, así que se agregó telemetría en el DRAW CALL mismo:
+  - `glActiveTexture_soloader`/`glBindTexture_soloader` (nunca estaban hookeados -- pasaban directo a
+    vitaGL): trackean la unidad activa y qué textura hay bindeada en las primeras 8 unidades.
+  - `mark_uniform_set()`/`uniform_was_ever_set()`: como vitaGL NO implementa `glGetUniformfv`/
+    `glGetUniformiv` (confirmado -- el primer intento de leer el uniform en vivo falló el link con
+    `undefined reference to glGetUniformfv`), no se puede preguntarle a la GPU "¿qué valor tiene este
+    uniform ahora?". En cambio, se registra cada `(program, location)` que un `glUniform4fv`/`1i` real
+    haya tocado alguna vez (tabla chica, ya se sabía por el punto anterior que son pocas para esta
+    familia) y se consulta ese registro en el draw call -- distingue "la location no existe en el
+    programa" (-1) de "existe pero nunca se seteó" (0) de "sí se seteó al menos una vez" (1).
+  - `glDrawArrays_soloader`/`glDrawElements_soloader` (tampoco estaban hookeados): si el programa activo
+    está en la lista `watch_program()`, logean `[gl_draw]` con el estado de `DiffuseColor`/`Sampler0`
+    (por el mecanismo de arriba) + unidad activa + textura bindeada en unidad 0/1, máximo 3 veces por
+    programa para no inundar una misión entera.
+- **Qué buscar en el próximo log:** líneas `[gl_draw]`. Si `Sampler0(ever_set=0)` y `tex@unit0=0` (sin
+  textura bindeada) en el momento del draw de personaje/caballo, confirma que el material dibuja leyendo
+  una unidad de textura vacía -- la causa raíz real, no una suposición más. Si en cambio `tex@unit0` trae
+  un id de textura válido, el negro vendría de otro lado (blending, depth, o la propia `tex1` pese al
+  guard) y habría que seguir esa pista en vez de la de bind-parámetros.
+
+### 2) Freeze al cambiar de stage -- causa confirmada por telemetría existente, fix acotado aplicado
+
+- `source/main.c`: `[render_diag]` promedia FPS cada 60 iteraciones del loop principal (`nativeGameRenderer
+  Render` + `gl_swap`) usando el tiempo real transcurrido. En la transición de stage de este log
+  (`grep -n "Go to state: Loading"` en línea 6108, `Exit state: Loading` en 6397): el frame más cercano
+  ANTES es `frame=24840 fps=59.9` (línea 6096) y el primero DESPUÉS es `frame=24960 fps=3.5` (línea 6423)
+  -- 120 frames "contados" pero la ventana de 60 que incluye la carga tardó ~17s reales (60/3.5).
+- **Mecanismo real (`source/patch.c`, `world_load_yield()`, ya existente de una sesión anterior):**
+  `World::LoadMap()` carga ~100+ game objects en un solo `do/while` sin ceder al loop principal; el
+  trampolín ya instalado llama a `world_load_yield()` en cada iteración de ese loop, que hace
+  `gl_swap()` cada 150ms para no perder el vblank por completo. Pero **nunca redibuja nada nuevo** (no
+  hay ningún `glClear`+draw entre esos swaps -- el propio loop de carga no llega a eso) y **nunca cede
+  input** (`controls_update()`/`sceKernelPowerTick()` viven en el loop principal de `main.c`, no en el
+  callback). El resultado visual es una pantalla estática (el mismo framebuffer presentado una y otra
+  vez) durante ~10-20s reales, exactamente lo que un usuario describe como "se queda congelado".
+- **Fix aplicado (`source/patch.c`):** se agregó `sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT)` en
+  CADA llamada a `world_load_yield()` (no solo cuando el throttle de 150ms deja pasar el `gl_swap`) --
+  sin esto, la consola pasaba la transición de stage completa sin un solo tick de energía, justo el
+  tipo de hueco que el power manager de la Vita puede interpretar como inactividad. **No se tocó**
+  `controls_update()` -- llamarlo desde acá tocaría estado de UI/touch del motor a mitad de la
+  construcción del mundo (widgets que capaz no existen todavía), riesgo de crash no descartado sin
+  probarlo; la mitigación real y de bajo riesgo para el freeze es reducir cuánto tarda la carga en sí
+  (ver punto 3).
+
+### 3) Carga lenta -- causa raíz encontrada y arreglada: el fcache de 64MB nunca liberaba espacio
+
+- `source/reimpl/io.c`: el log confirma `[fcache] cached ... 67108796/67108864 bytes total in 155
+  files` -- el presupuesto de 64MB (`FCACHE_MAX_TOTAL_BYTES`) está prácticamente lleno (68 bytes de
+  margen) apenas con el splash + main menu + la primera misión cargados. `fcache_populate()` frente a
+  un cache lleno simplemente hacía `return` sin cachear el archivo nuevo -- **para siempre, el resto de
+  la sesión**: cualquier asset pedido después de ese punto (incluyendo archivos que el motor reabre
+  muchas veces entre transiciones de stage, como los `.glsl`/`.array`/`.graphml` comunes) pagaba I/O de
+  disco real sin ningún beneficio de cache, sesión completa. No había eviction de ningún tipo.
+- **Fix (`source/reimpl/io.c`):**
+  - `FCacheEntry` suma `last_used` (contador monotónico `s_fcache_clock`, incrementado en cada hit real
+    vía `fcache_open_handle_locked()` y en la creación de la entrada).
+  - `fcache_make_room_locked(need)`: cuando el cache está lleno, evict de las entradas SIN handle
+    abierto (`fcache_entry_is_pinned_locked()` -- nunca evict algo que un `FILE*` todavía está leyendo,
+    dejaría ese puntero colgando) en orden LRU hasta liberar espacio suficiente; si todo lo que queda
+    está pineado, falla igual que antes (degradación segura, no peor que el comportamiento previo).
+  - `fcache_evict_locked(idx)`: a diferencia de `fcache_invalidate()` (que ya existía y hace
+    swap-con-el-último), esta usa `memmove` + reindexado de CADA handle abierto (`entry_idx > idx` se
+    decrementa) -- swap-con-el-último rompe cualquier handle abierto sobre la entrada que estaba en la
+    última posición, ya que los handles guardan un índice plano, no un puntero. No se tocó
+    `fcache_invalidate()` (out of scope, y su patrón de uso -- justo después de escribir un save file --
+    hace ese bug preexistente improbable en la práctica).
+  - `fcache_populate()` ahora llama `fcache_make_room_locked(size)` en vez de rendirse directo cuando no
+    entra.
+  - No se subió `FCACHE_MAX_TOTAL_BYTES` (64MB) -- sin datos de cuánta RAM libre tiene el port en
+    consola real, subir el presupuesto a ciegas arriesga OOM; el fix real es que el presupuesto
+    EXISTENTE se siga aprovechando toda la sesión en vez de sólo hasta que se llena una vez.
+
+### Validación
+
+- `psvita-toolkit build --preset debug --clean` limpio. `nm` sobre `build/sacredodyssey.elf` (build
+  limpio, no incremental -- un primer chequeo contra un `.elf` viejo en `build/` había dado falso
+  negativo) confirma todos los símbolos nuevos: `glActiveTexture_soloader`, `glBindTexture_soloader`,
+  `glDrawArrays_soloader`, `glDrawElements_soloader`, `mark_uniform_set`, `log_watched_draw_state`,
+  `fcache_make_room_locked`, `fcache_evict_locked`. `eboot.bin`/`sacredodyssey.vpk` regenerados,
+  copiados a la raíz, y desplegados con `psvita-toolkit deploy --eboot --yes` (FTP respondió).
+- **Pendiente (consola física):** confirmar que el freeze de stage se sienta igual o mejor (el fix de
+  power-tick es defensivo, no debería empeorar nada) y traer un log nuevo con:
+  - Líneas `[gl_draw]` durante la escena del personaje/caballo -- la pieza que falta para el fix real
+    de la textura negra (punto 1).
+  - `[fcache] evicting ...` -- confirma que la eviction LRU está funcionando en vez de agotarse en
+    silencio; comparar cuántos `fopen` reales (no `fcache hit`) hay en la segunda mitad de la sesión
+    contra este log (donde, con el cache agotado, cada archivo después del límite pagaba I/O real).
+
+## Sesión 2026-09-18 (tercera vuelta) — `logs/log_20260918_152457.txt`: la eviction del fcache SÍ funciona; `[gl_draw]` nunca disparó por un bug de capacidad en la propia telemetría
+
+- **Reporte del usuario:** "todavia quedan texturas negras, pero ya parece que tiene mas" (fps/velocidad
+  percibida mejor -- consistente con la eviction de fcache funcionando, ver abajo).
+- **fcache eviction confirmada funcionando:** `grep -c "evicting"` = 56 en esta sesión (vs. 0 posible
+  antes del fix). El presupuesto de bytes ya no se agota en silencio.
+- **Nuevo límite descubierto en el mismo mecanismo:** el log llega a `[fcache] cached ... 65709636/
+  67108864 bytes total in 512 files` y ahí se detiene -- bytes con margen de sobra (~1.3MB libres) pero
+  `s_fcache_entry_count` topó `FCACHE_MAX_ENTRIES` (512), un límite SEPARADO que `fcache_populate()`
+  todavía no sabía evictar (solo lo hacía por bytes). **Fix (`source/reimpl/io.c`):** extraído
+  `fcache_evict_one_lru_locked()` (compartido por el path de bytes y el de entradas) y el chequeo
+  `s_fcache_entry_count >= FCACHE_MAX_ENTRIES` ahora evict-ea un LRU en vez de rendirse.
+- **`[gl_draw]` (la telemetría nueva de esta misma sesión) nunca disparó ni una vez -- bug de capacidad
+  en la telemetría, no ausencia de evidencia:** `grep -n "gl_watch] program"` muestra 14 programas
+  watched (10,11,12,17,18,19,24,25,26,31,32,33,38,39) pero el programa **40** -- el material
+  `TEXTURESKINNED` de `KnightsOdyssey_hand_diffuse` identificado la sesión anterior via `Unused
+  parameter: Map__3__...` -- falta. Causa: `MAX_WATCHED` estaba en 16, y los shaders de programas 10-39
+  ya ocupaban las 16 entradas (`grep -n "gl_watch] shader"` cuenta shader #78 como el 16º). Los shaders
+  #79/#80 (del programa 40) imprimían igual la línea `"[gl_watch] shader #N flagged"` -- el `l_info` no
+  chequeaba si `watch_shader()` realmente había guardado el slot -- pero `watch_shader()` los descartaba
+  en silencio con el array lleno, `glAttachShader_soloader` nunca veía `shader_is_watched()==true` para
+  ellos, y el programa 40 jamás entraba a `s_watched_programs`. Sin eso, `log_watched_draw_state()`
+  (llamada desde `glDrawArrays_soloader`/`glDrawElements_soloader`) hacía `if
+  (!program_is_watched(cur_program)) return;` en la primera línea para CADA draw call del programa 40,
+  siempre. El log estaba mintiendo ("flagged" cuando en realidad se había descartado).
+- **Fix (`source/utils/glutil.c`):** `MAX_WATCHED` 16 -> 64 (256 bytes extra de estático, nada). Los dos
+  logs de "flagged"/"watched" ahora chequean el valor de retorno de `watch_shader()`/`watch_program()`
+  (que ahora devuelven si el slot se guardó de verdad) y logean un `l_warn` distinto si el array vuelve a
+  llenarse, en vez de mentir con el mismo mensaje de éxito.
+- **Validación:** `psvita-toolkit build --preset debug` limpio (incremental esta vez -- se verificó con
+  `nm` contra `build/sacredodyssey.elf` con timestamp fresco, no el `.elf` viejo que dio falso negativo
+  la sesión anterior). `fcache_evict_one_lru_locked`/`glDrawArrays_soloader`/`log_watched_draw_state`
+  confirmados en el binario. `eboot.bin`/`sacredodyssey.vpk` regenerados, copiados a la raíz, desplegados
+  con `psvita-toolkit deploy --eboot --yes` (FTP OK).
+- **Pendiente (consola física):** repetir la escena del personaje/caballo y traer el log nuevo -- ahora
+  el programa 40 (y cualquier otro que antes se perdía por el cupo de 16) debería aparecer en
+  `[gl_watch] program N <-` y, más importante, generar líneas `[gl_draw]` reales que por fin muestren si
+  `Sampler0`/`DiffuseColor` se setearon alguna vez y qué textura hay bindeada en la unidad activa en el
+  momento del draw -- la evidencia que se buscó desde el principio de esta sub-investigación.
+
+## Sesión 2026-09-18 (cuarta vuelta) — causa raíz de sectores negros en personaje/montura: Sampler1 de MULTITEXTURED es envmap aditivo, no detail multiplicativo
+
+- **Reporte del usuario:** "Mejora las texturas del personaje jugable y montura, tiene sectores en negro"
+  (`logs/log_20260918_155612.txt`, eboot 15:37) + captura `screenshots/hj/2026-09-16/2026-09-16-204503.jpg`
+  (torso/pantalones del personaje negros, cara/manos con piel visible; mundo estático perfecto).
+- **Evidencia en el log:** `Unused parameter: Map__3__KnightsOdyssey_hand_diffuse.tga_-sampler` (1x) +
+  `invalid bind symbol: envmapIntensity` (21x) + `Unused parameter: envmapIntensity` alrededor de la carga
+  de `mc.bdae`/`body_envmap.kot`/`magic_horse.kot`.
+- **Causa confirmada por strings de las .bdae LOCALES (no adivinada):** `Material__0` de `mc.bdae` declara la
+  técnica `TEXTURED|MULTITEXTURED` (`ProfileCOMMON_emul_FS.glsl`) con uniforms `DiffuseColor`,
+  `envmapIntensity`, `Sampler0`, `TextureMatrix0`, `Sampler1`, y sus params son `Map__3__...-sampler` +
+  `Material__0-sampler` + `Material__0-envmapsurface-sampler`. Barrido de las 556 `.bdae` del dataset:
+  las 13/13 que usan `#define MULTITEXTURED` (`MainCharacter/mc*`, `magic_horse*`, `Beetle`,
+  `DemonSoldier*`, `Orc*`) contienen `envmap` — en este juego MULTITEXTURED ⇔ difuso + envmap, sin
+  excepción. El `color *= tex1` del FS emulado multiplicaba el difuso por una textura de envmap
+  típicamente oscura (ej. `body_envmap.kot` 64x64) muestreada con UVs de difuso → parches negros donde el
+  envmap salía oscuro; la guarda `> 0.03` no salvaba porque el envmap real sí trae señal y encima
+  `envmapIntensity` (que en el programa real modula el aporte) ni estaba declarado (`invalid bind symbol`).
+- **Fix (`source/utils/embedded_shaders.c`, `s_ProfileCOMMON_emul_FS`):** declarado
+  `uniform float envmapIntensity;` (el binder ya lo buscaba: ahora lo encuentra y le pone la intensidad
+  real del material; en default GL 0.0 es no-op) y `Sampler1` pasa a aditivo:
+  `color.rgb += texture2D(Sampler1, vTexCoord0).rgb * envmapIntensity;`. Una unidad vacía aporta
+  `(0,0,0)` → imposible ennegrecer. `UnlitMultiTexturedFP` (sprites 2D, `texture1`/`texture2`) no se toca.
+  El reinstall de `ensure_embedded_shaders_installed()` compara CONTENIDO → el `.glsl` nuevo se instala
+  solo en el próximo arranque; el shader cache de vitaGL re-compila por hash distinto.
+- **Telemetría para verificar en el próximo log (`source/utils/glutil.c`, `glutil.h`, `dynlib.c`):**
+  `interesting_uniform()` ahora matchea `sampler` en minúsculas y `Map__` (los queries
+  `Map__3__...-sampler` pasaban en crudo sin loguearse ni una vez por case-sensitivity), y se wrapearon
+  `glUniform1iv`/`glUniform1f`/`glUniform4f` (el binder puede setear samplers/`envmapIntensity`/
+  `DiffuseColor` por esas variantes; antes `ever_set` del `[gl_draw]` mentía "nunca seteado"). `[gl_u1f]`
+  loguea el valor → confirma que el aditivo recibe la intensidad real.
+- **Validación:** build completo limpio desde cero (`/tmp/sacredodyssey-build`, preset Debug) con el
+  workaround `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` (el `vita.toolchain.cmake` pide compat < 3.5 y el cmake
+  de Homebrew es 4.x — ajeno a este cambio). `eboot.bin` (620864 B) / `sacredodyssey.vpk` regenerados y
+  copiados a raíz + `build/`. **Pendiente (consola física):** `deploy --eboot`, repetir escena de
+  personaje/montura y traer log: se espera `envmapIntensity` sin `invalid bind symbol`, líneas `[gl_u1f]`
+  con la intensidad, y torso del personaje + caballo con difuso intacto + reflejo especular.
+
+## Sesión 2026-09-18 (quinta vuelta) — stick derecho como dedo virtual, iconos superiores visibles, fix de corrupción en fcache_invalidate + progreso de LoadMap
+
+Tres pedidos del usuario en un pase, un fix cada uno (compilación limpia desde cero, Debug):
+
+### 1. Stick derecho = cámara como un dedo, precisa (`source/controls.c`)
+- **Problema:** el hook de `CameraRotatePad` sumaba hasta 8.5 "px" por llamada mientras un dedo real
+  produce deltas acumulados de cientos de px — lento e impreciso al lado del táctil.
+- **Fix:** dedo VIRTUAL. Con el stick deflectado se integra su velocidad en un drag persistente
+  (`s_vcam_cur_x/y`) y se emite `cur - start`, la misma magnitud que el path táctil real
+  (`cur_x - start_x`), así el motor aplica al stick sus propias curvas de dedo sin adivinar
+  sensibilidad: fino cerca del centro (fracciones de px, `out` es float), ~720 px/s a tope (12
+  px/llamada a 60 fps), clamp ±500 como bordes de pantalla, deadzone 0.18 → 0.12. Al centrar se
+  "levanta el dedo" (reset, sin saltos). No toca memoria del engine (solo `out[]`): convive con el
+  táctil real.
+
+### 2. Iconos superiores siempre visibles (`source/controls.c`)
+- **Problema:** el dimming a `DIM_ALPHA` (~7%) alcanzaba a todos los iconos, incluidos retrato/vida
+  del personaje (arriba-izquierda) y Mini_Map (arriba-derecha).
+- **Fix:** `HUD_OFFSET_MINI_MAP` sale de la lista dim; `HUD_OFFSET_HEALTH_GROUP` (ya estaba fuera) y
+  `HUD_OFFSET_MINI_MAP` se fuerzan a 255 cada frame — también pisa cualquier dimming propio del motor.
+  El resto del HUD sigue atenuado (y L+R lo revela todo como antes). El tap sintético de SQUARE al
+  mapa sigue funcionando (alpha no afecta hit-testing, solo lo visual).
+
+### 3. Congelado al pasar de un stage a otro (`source/reimpl/io.c`, `source/patch.c`)
+- **Bug real encontrado y corregido (corrupción, no especulación):** `fcache_invalidate()` usaba
+  swap-with-last SIN ajustar los `entry_idx` de los handles abiertos — el propio comentario de
+  `fcache_evict_locked()` advertía de ese peligro para su propio caso. Cualquier handle abierto sobre
+  la última entrada quedaba re-apuntado en silencio a OTRO archivo (o a memoria liberada) y el engine
+  parseaba basura: cuelgue sin dump en el peor caso. Alcanzable justo en transición de stage, que es
+  cuando se abre `SaveGame.bin` en escritura (autoguardado) mientras otros assets siguen abiertos.
+  Ahora usa shift+fixup (`fcache_evict_locked`, los handles ajenos ni se enteran) y, si la entrada
+  invalidada TIENE lectores abiertos, se marca `stale` (nuevo flag en `FCacheEntry`, +512 B) en vez de
+  liberarse bajo ellos: los lectores viejos terminan con sus bytes (como fd abierto tras unlink), las
+  aperturas nuevas van a disco (`fcache_find_valid_entry_locked`), `populate` reemplaza el stale sin
+  lectores por el fresco, y `fclose` evicta el stale al cerrarse el último handle.
+- **Diagnóstico para lo que quede:** `world_load_yield()` ahora cuenta objetos del do/while de
+  `World::LoadMap` y loguea `[loadmap] N game objects loaded (T ms)` cada 25 (+ `object loop start`;
+  >5 s sin llamadas = corrida nueva). Si alguna transición se sigue congelando, el log muestra cuántos
+  objetos completaron y, cruzado con el último `Loading game object: X` del engine, identifica el objeto
+  que cuelga sin necesidad de adivinar.
+- **Validación:** build completo limpio desde cero (`/tmp/sacredodyssey-build`, Debug,
+  `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` por el cmake 4.x de Homebrew vs `vita.toolchain.cmake`).
+  `eboot.bin` (621515 B) / `sacredodyssey.vpk` regenerados y copiados a raíz + `build/`.
+- **Pendiente (consola física):** `deploy --eboot`, probar (a) cámara con stick derecho en juego,
+  (b) retrato + minimapa a opacidad completa, (c) transición de stage con autoguardado; si (c) se
+  sigue congelando, traer el log — las líneas `[loadmap]` dicen dónde.
+
+## Sesión 2026-09-19 — causa raíz real de los bajones de FPS en combate contra el jefe: la propia telemetría de diagnóstico de la sesión anterior
+
+- **Reporte del usuario** (`logs/log_20260919_152329.txt`): "bajones de FPS al luchar con el jefe
+  cuando se cae por una explosion al igual que al pasar a otros stage" + pedido de HUD (ver debajo).
+- **Causa confirmada, no especulada:** el commit `0a2e4a7` (sesión anterior, "telemetria dirigida a
+  programas MULTITEXTURED+SKINNED") agregó `l_info()` SIN NINGÚN LÍMITE en `glUniform4fv_soloader`/
+  `glUniform1i_soloader`/`glUniform1iv_soloader`/`glUniform1f_soloader`/`glUniform4f_soloader`
+  (`source/utils/glutil.c`) para CUALQUIER programa "watched" (los 13 materiales MULTITEXTURED del
+  dataset: personaje, caballo, jefe, Beetle/DemonSoldier/Orc) durante el resto de la sesión —
+  `(counter < N || program_is_watched(cur_program))`, y una vez watched el `OR` se cumple siempre.
+  Cada `l_info()` que llega a los sinks de archivo/UDP hace un `sceIoOpen+Write+Close` + `sendto`
+  bloqueantes (`source/utils/logger.c`, ya documentado ahí: "the game stalls on a single frame for
+  the whole duration of such a burst"). Una pelea contra el jefe dibuja jugador+montura+jefe TODOS
+  los frames, cada uno con varios uniforms (DiffuseColor/envmapIntensity/Sampler0/Sampler1/matrices
+  de hueso) → decenas de estas llamadas sin throttle, 60 veces por segundo, mientras dura el combate
+  — coincide exactamente con "bajón al luchar con el jefe". `log_watched_draw_state()` (el `[gl_draw]`
+  de `glDrawArrays`/`glDrawElements`) YA tenía un cap de 3 logs por programa desde que se escribió;
+  las 5 wrappers de `glUniform*` no tenían el mismo cap — la asimetría era el bug.
+- **Fix (`source/utils/glutil.c`):** nuevo `watched_uniform_log_budget(program)` (presupuesto de 30
+  logs por programa watched, tabla paralela a `s_watched_programs`); las 5 wrappers cambian su
+  condición de `program_is_watched(cur_program)` a `watched_uniform_log_budget(cur_program)`. Se
+  mantiene la misma evidencia de diagnóstico (Sampler1/envmapIntensity en los primeros draws de cada
+  material, ya usada para confirmar el fix del envmap aditivo de la sesión anterior) sin pagar el
+  costo el resto del combate/misión. `mark_uniform_set()` (necesario para el `ever_set` de
+  `[gl_draw]`) sigue llamándose siempre, sin presupuesto — es una tabla en memoria, no logging.
+- **Segunda causa, menor pero real (`source/reimpl/io.c`):** cada instancia de explosión/partícula
+  (bomba, jefe cayendo) reabre el mismo puñado de archivos (`bombexplosion.bdae`, `bombexplosion2.bdae`,
+  `fireball.kot`, `glow04.kot`, `sfx_MC_bomb_explode.kow`, ...) — confirmado por decenas de
+  `fopen(...bombexplosion...): 0x... (fcache hit)` en pocos cientos de líneas del log durante el
+  combate. El throttle de líneas repetidas de `logger.c` (`_log_throttle_sinks`, ya existente) compara
+  el TEXTO completo — el `%p` del handle (distinto en cada open/close) hacía que cada repetición
+  pareciera una línea nueva y nunca se throttleara. Fix: se sacó el `%p` de
+  `l_debug("fopen(%s, %s): ... (fcache hit)")` y de `l_debug("fclose(%p): ...")` (este último ahora
+  loguea el `path` — capturado del `FCacheEntry` ANTES de soltar el mutex/evictar, ya que se necesita
+  antes de que `fcache_evict_locked()` pueda mover la entrada) — reaperturas del mismo path+mode ahora
+  son byte-idénticas y el throttle existente las corta después de la 3ra, sin inventar mecanismo nuevo.
+- **Validación:** `psvita-toolkit build --preset debug` limpio. `nm` contra `build/sacredodyssey.elf`
+  confirma `watched_uniform_log_budget`. `eboot.bin` (621765 B)/`sacredodyssey.vpk` regenerados,
+  copiados a raíz, desplegados con `deploy --eboot --yes` (FTP OK).
+- **Pendiente (consola física):** repetir la pelea contra el jefe (con la caída por explosión) y la
+  transición de stage; traer un log nuevo y confirmar con `grep -c` que `[gl_u4v]`/`[gl_u1i]`/`[gl_u1f]`
+  ya no siguen creciendo sin límite por programa, y que `fopen(...bombexplosion...)` empieza a mostrar
+  `(repeated Nx)` en vez de una línea nueva por cada apertura.
+
+### HUD: menú + espada superior derecha a opacidad completa, resto atenuado de forma pareja
+
+- **Pedido del usuario:** mostrar SIEMPRE icono de menú, personaje, minimapa y espada superior
+  derecha; mantener oculto (atenuado) el resto, un poco más claro que antes si es posible; los demás
+  iconos contextuales que aparezcan deberían tratarse igual que el resto (no quedar sueltos a opacidad
+  completa del motor).
+- **Fix (`source/controls.c`):** `button_toSysIGM` (icono de menú) y `button_sword` (espada,
+  cluster derecho) se suman a la lista de opacidad completa (255) junto a `status_healthGroup`
+  (personaje) y `Mini_Map`, y salen de la lista atenuada. Los iconos contextuales que nunca habían
+  estado en ninguna lista (`button_pickUpBomb`, `button_pushBox`, `button_talkToNPC`,
+  `button_openTreasure`, `button_rotateMirror`, `button_ironEagle/Fist/Chain`,
+  `button_HudTurtorialDialogInGame`) se agregan a la lista atenuada — antes se mostraban a la opacidad
+  default del motor, inconsistente con "el resto" que debía quedar discreto. `DIM_ALPHA` sube de 18
+  (~7%) a 40 (~16%) para que los atenuados se puedan distinguir en vez de casi desaparecer. El toque
+  real sigue funcionando en todos los casos (`dim_widget` sólo cambia alpha, nunca el flag
+  visible/active).
+- **Pendiente (consola física):** confirmar que menú + espada se ven siempre junto a personaje/
+  minimapa, que el resto sigue atenuado pero ya no invisible, y que los íconos contextuales (bomba/
+  caja/NPC/tesoro/espejo/Iron*) ya no aparecen a opacidad completa cuando el motor los activa.
+
+## Sesión 2026-09-19 (segunda vuelta) — joystick derecho no hacía NADA para la cámara: causa raíz encontrada cruzando el pseudo-C de Ghidra, no adivinada
+
+- **Reporte del usuario:** "el joystick derecho no hace nada para mover la camara a diferencia del
+  izquierdo que si mueve al personaje" + pedido de revisar cómo maneja la cámara Shadow-Guardian-vita
+  (otro port en la misma máquina). Shadow Guardian resultó ser 100% touch-driven (sin hooks nativos de
+  pad — el right stick ahí simula un drag de dedo vía `nativeGameGLSurfaceViewOnTouch`, técnica ya
+  usada en este port para el touch real pero irrelevante para la causa de Sacred Odyssey, que SÍ tiene
+  hooks nativos de `Get_MovePad_AxisValues`).
+- **Causa real (confirmada en `decompiled/decompiled_so/libsacredodyssey_v106/out_ghidra.c`, cruzada
+  con `nm` sobre el `.so` real, no especulada):** `MoveState::Update()` (personaje) llama
+  `HudMovePad::Get_MovePad_AxisValues()` de forma INCONDICIONAL, todos los frames (línea ~58337) — por
+  eso el stick izquierdo/movimiento siempre funcionó a través de nuestro hook. La cámara es distinta:
+  el update de cámara (línea ~102416, función decompilada como `Update(int)` sobre lo que resuelve a
+  CameraManager) sólo llama `CameraRotatePad::Get_MovePad_AxisValues()` DENTRO de un
+  `if (*(char *)(*(int *)(*(int *)(Gameplay::s_instance + 0x28) + 8) + 0x1a) != 0)`. Se confirmó que
+  `*(Hud **)(Gameplay::s_instance + 0x28)` ES `Hud::s_pInstance` (decenas de sitios en el mismo archivo
+  lo usan como primer argumento de `Hud::AddHudMessage`/`Hud::PushIGM`/`Hud::BeginShowInfo`), y que `+8`
+  es exactamente `HUD_OFFSET_CAMERAPAD` ya usado en `source/controls.c` — o sea el gate lee un byte
+  DENTRO del mismo widget CameraRotatePad que ya resolvíamos. Ese byte en `+0x1a` es "hay un touch real
+  encima de este widget ahora mismo": lo calcula `HudWidget::UpdateTouchInfo(int)` (símbolo confirmado
+  `_ZN9HudWidget15UpdateTouchInfoEi` vía `nm -D` sobre el `.so` real) a partir de
+  `HudEngine::GetTouchPointInfo()`, y se resetea a 0 sin un dedo real encima. Sin touch físico en esa
+  zona de pantalla, el gate nunca pasa y nuestro propio hook de `Get_MovePad_AxisValues` (que ya sabía
+  leer el stick físico desde la sesión anterior, "dedo virtual") JAMÁS se ejecutaba con el stick solo —
+  no era un problema de sensibilidad/deadzone como se pensó antes, la función simplemente no se llamaba.
+- **Fix (`source/controls.c`):** se hookea `CameraRotatePad::UpdateTouchInfo(int)` (símbolo confirmado
+  `_ZN15CameraRotatePad15UpdateTouchInfoEi`), NO `Get_MovePad_AxisValues` (que ya estaba bien). El hook
+  preserva el comportamiento original al 100% (acumula el timer de doble-tap propio de CameraRotatePad
+  en `+0x174` y llama a `HudWidget::UpdateTouchInfo` -- la clase base, resuelta pero NO hookeada, vía
+  `_ZN9HudWidget15UpdateTouchInfoEi` -- exactamente como hacía el override real) y SÓLO DESPUÉS, si el
+  stick derecho físico está deflectado este frame (mismo deadzone 0.12 que ya usaba
+  `hook_CameraRotatePad_Get_MovePad_AxisValues`), fuerza `+0x1a = 1`. Nunca compite con un touch real
+  (si hay un dedo real tocando, el byte ya queda en 1 de por sí) y nunca se ejecuta antes de tiempo: el
+  flag para "stick deflectado" (`s_cam_stick_deflected`) se calcula en `controls_update()`, que
+  `source/main.c` ya llama ANTES de `nativeGameRendererRender()` cada frame -- así el valor está listo
+  para cuando el hook (llamado DESDE adentro de ese render call) y después `CameraManager::Update` lo
+  lean, sin depender de adivinar el orden interno exacto del motor.
+- **Validación:** `psvita-toolkit build --preset debug` limpio. `nm` contra `build/sacredodyssey.elf`
+  confirma `hook_CameraRotatePad_UpdateTouchInfo`/`s_hudwidget_update_touch_info`/
+  `s_cam_stick_deflected`. `eboot.bin`/`sacredodyssey.vpk` regenerados, copiados a raíz, desplegados con
+  `deploy --eboot --yes` (FTP OK).
+- **Pendiente (consola física):** probar la cámara con el stick derecho SIN tocar la pantalla (el caso
+  que antes no hacía nada) y confirmar que sigue funcionando bien con touch real simultáneo o alternado
+  (no debería haber conflicto, ver el fix arriba). Si el log muestra
+  "Hooked CameraRotatePad::UpdateTouchInfo successfully" pero la cámara sigue sin moverse, el problema
+  estaría en `s_vcam_cur_x/y` (la lógica de dedo virtual dentro de `Get_MovePad_AxisValues`, ya validada
+  en la sesión anterior) y no en el gate -- traer un log nuevo para diferenciar.
+
+## Sesión 2026-09-19 (tercera vuelta) — `logs/log_20260919_211800.txt`: personaje/minimapa/espada seguían sin verse (visible=0, no solo alpha) + segundo stall de carga encontrado y parcheado (graphical maps, no game objects)
+
+### 1) HUD: alpha=255 no bastaba -- faltaba forzar "visible" también
+
+- **Reporte del usuario:** "veo el menu, pero falta el personaje sobre el menu y el mini mapa de la
+  derecha y la espada sobre el mini mapa, el resto que se mantenga asi."
+- **Causa:** `dim_widget()` (sesión anterior) sólo toca alpha (offset +4, AnimObject), nunca los flags
+  `visible`/`active` (+0x18/+0x19) del `HudWidget` -- a propósito, para no pisar estado del motor. Pero
+  si el motor arranca esos 3 widgets con `visible=0` (probable: el menú sí arranca visible por defecto,
+  de ahí que ESE se viera y los otros tres no), ningún alpha los va a hacer aparecer.
+- **Fix (`source/controls.c`):** nueva `force_widget_shown(offset)` que fuerza `visible=1`, `active=1`
+  Y alpha=255 (llamando a `dim_widget` internamente), aplicada SOLO a los 4 widgets que el usuario pidió
+  siempre visibles (`HEALTH_GROUP`, `MINI_MAP`, `SYS_IGM`, `SWORD`). El resto del HUD sigue con
+  `dim_widget` (solo alpha, sin tocar visible/active) exactamente como antes.
+
+### 2) Segundo stall de carga real: "World loading: graphical maps" (no el de "game objects" ya arreglado)
+
+- **Evidencia:** el usuario reportó "todavia tuve bajones" pese al fix de logging de la sesión anterior.
+  `[render_diag]` en el nuevo log sigue con mínimos de 1.2-13 fps en varios puntos que NO coinciden con
+  la carga de game objects ya cubierta, sino con `--------WorldManager::UnloadWorld()` seguido de
+  `--------LoadWorld() world N!` + `World loading: graphical maps` -- cientos de líneas de
+  `[fcache] cached`/`evicting` cargando texturas de escena (.kot) sin un solo `[render_diag]` de por
+  medio (ej. frame=24240 fps=59.9 -> frame=24300 fps=3.1, con ~600 líneas de I/O entre medio).
+- **Causa confirmada en el .so real (no solo en el pseudo-C):** `arm-vita-eabi-objdump -d
+  --start-address=0x217050` sobre `libsacredodyssey.so` (v106) muestra que `World::LoadMap()` es una
+  máquina de estados (`switch` sobre un contador propio) con DOS do/while separados: `case 0`
+  ("graphical maps", 0x217078-0x2170f0) llama a `World::Add3DMap()` una vez por cada mapa 3D adicional
+  de la escena, y `case 1` ("game objects", 0x217192-0x2171b0, ya arreglado en una sesión anterior) el
+  de los ~100+ game objects. El loop de `case 0` (0x2170b0-0x2170ce) NUNCA tenía ningún yield -- mismo
+  problema, código completamente distinto.
+- **Fix (`source/patch.c`, `so_patch_v106()`):** mismo patrón y misma disciplina que el fix ya existente
+  (opcodes verificados ensamblando con `arm-vita-eabi-as`/`-ld -Ttext=<dirección>`, no calculados a
+  mano; verificado además cross-checkeando la tabla de símbolos del linker, que confirmó el placeholder
+  del `.word` en la dirección exacta que el `ldr r3,[pc,#12]` iba a leer). Reutiliza la MISMA cueva
+  muerta de `ALicenseCheck::LoadConfig` (el trampolín de la sesión anterior ocupa 0x3463d4-0x3463ec;
+  este usa el espacio libre justo después, 0x3463ec-0x346404 -- la siguiente función real,
+  `ALicenseCheck::Init`, arranca en 0x346450, sobran 76 bytes incluso después de este segundo
+  trampolín). Reemplaza `ldr r3,[r4,#72]; mov r0,r4` (0x2170b0, primeras 2 instrucciones de cada
+  iteración) por un `b.w` al trampolín, que replica esas 2 instrucciones, llama a `world_load_yield()`
+  (el mismo callback ya usado por el fix anterior: `gl_swap()` throttleado a 150ms +
+  `sceKernelPowerTick` todos los frames) y salta de vuelta -- mismo guard de bytes-originales-esperados
+  antes de escribir (si no matchean, loguea WARN y no toca nada, en vez de corromper código a ciegas).
+- **Validación:** `psvita-toolkit build --preset debug` limpio. `nm` contra `build/sacredodyssey.elf`
+  confirma `force_widget_shown`. Re-verificado con `arm-vita-eabi-objdump` sobre el `.so` REAL desplegado
+  que los bytes en 0x2170b0 siguen siendo `6ca3 4620` (coinciden con el guard `0x46206ca3`, o sea el
+  parche va a aplicar, no a saltarse). `eboot.bin`/`sacredodyssey.vpk` regenerados, copiados a raíz,
+  desplegados con `deploy --eboot --yes` (FTP OK, tras reabrir VitaShell -- la primera conexión dio
+  "Connection refused", conocido: hay que activar FTP con SELECT en VitaShell antes de cada sesión de
+  deploy).
+- **Pendiente (consola física):** confirmar que personaje/minimapa/espada ahora se ven todo el tiempo, y
+  que la transición a la pantalla del mapa del mundo (o cualquier "LoadWorld()") ya no cae por debajo de
+  ~20-30fps. Si el log muestra "Patched v106 World::LoadMap graphical-maps loop yield" pero el stall
+  sigue igual, sería evidencia de que el costo real es CPU/GPU (decode+upload de texturas) y no
+  ausencia de yield -- haría falta perfilar cuánto tarda cada `Add3DMap()` individual.
+- **Confirmado por el usuario (`logs/log_20260920_000922.txt`):** ambos parches de yield se aplicaron
+  ("Patched v106 World::LoadMap game-object loop yield" + "...graphical-maps loop yield") y el perfil
+  de FPS del log mejoró notablemente (promedio 53.9 fps, solo 4/98 muestras por debajo de 20, contra
+  14/451 del log anterior) -- evidencia de que el segundo parche sí ayuda, aunque falta que el usuario
+  confirme la sensación en consola física de forma explícita.
+
+## Sesión 2026-09-20 — la "espada" que se forzó a mostrar era el widget equivocado
+
+- **Reporte del usuario:** "agregaste una espada en la parte superior derecha, no era agregarla sino
+  ponerle la opacidad completa al igual que al personaje sobre el boton de pausa."
+- **Causa:** `HUD_OFFSET_SWORD` (offset 56, `button_sword`) resultó ser un widget que el motor NO
+  muestra durante gameplay normal (probablemente exclusivo de otra pantalla, ej. inventario/pausa).
+  `force_widget_shown()` (sesión anterior) lo forzaba a `visible=1`+`active=1`, lo que efectivamente lo
+  hacía aparecer -- pero como un ícono ajeno/fuera de contexto, no como "el mismo ícono de espada tenue
+  que ya se veía, ahora más opaco" que pedía el usuario. El ícono REAL que sí se renderiza en gameplay
+  normal (y que hasta ahora se atenuaba junto al resto del HUD) es `HUD_OFFSET_SWITCH_WEAPON` (offset
+  52, `button_switchWeapon`) -- los comentarios de sesiones viejas ya agrupaban ambos como "cluster
+  derecho" sin haber verificado cuál de los dos era el que efectivamente se veía en pantalla.
+- **Fix (`source/controls.c`):** revertido. `HUD_OFFSET_SWORD` vuelve a la lista atenuada normal
+  (`dim_widget(..., hud_alpha)`-- inocuo, ya que el motor no lo muestra de todas formas).
+  `HUD_OFFSET_SWITCH_WEAPON` sale de esa lista y pasa a opacidad completa con `dim_widget(...,
+  255)` -- SOLO alpha, sin `force_widget_shown()`/visible/active, porque este widget SÍ se renderiza
+  normalmente (de ahí que alpha alcance, sin necesidad de forzar nada más, tal como pidió el usuario:
+  "ponerle la opacidad completa", no reactivar un widget oculto).
+- **Validación:** `psvita-toolkit build --preset debug` limpio. `eboot.bin`/`sacredodyssey.vpk`
+  regenerados, copiados a raíz, desplegados con `deploy --eboot --yes` (FTP rechazó la primera
+  conexión -- hubo que reabrir FTP en VitaShell con SELECT antes del reintento, igual que la sesión
+  anterior).
+- **Pendiente (consola física):** confirmar que ahora se ve el ícono de cambio de arma (ya existente,
+  visible de por sí) a opacidad completa en el cluster superior derecho, sin ningún ícono "nuevo" o
+  fuera de lugar apareciendo. Si el usuario sigue sin ver NADA parecido a una espada arriba a la
+  derecha, es señal de que ninguno de los dos offsets (`SWORD`/`SWITCH_WEAPON`) es el ícono que el
+  usuario tiene en mente -- pedir una captura de pantalla en ese caso en vez de seguir adivinando por
+  offset.
+
+## Sesión 2026-09-20 (segunda vuelta) — el "personaje" es un hijo de status_healthGroup, no el grupo en sí
+
+- **Reporte del usuario:** "El personaje al lado de la vida y sobre el boton del menu sigue oculto debe
+  tener la opacidad completa" (`logs/log_20260920_005427.txt`; único otro comentario: "el unico issue
+  que he visto son los FPS erraticos" -- documentado, no un pedido de fix nuevo en este pase).
+  `force_widget_shown(HUD_OFFSET_HEALTH_GROUP)` (sesión anterior) no alcanzaba.
+- **Causa confirmada (no adivinada por offset esta vez):** se leyó `Hud::InitHudWidgets()` completo en
+  el pseudo-C (`out_ghidra.c`) para tener el mapeo REAL offset<->nombre de cada widget (confirmó que
+  `HUD_OFFSET_HEALTH_GROUP=96` sí corresponde a `"status_healthGroup"`, sin error ahí). Pero
+  `status_healthGroup` es un widget GRUPO -- `strings` sobre el asset real
+  (`data/menus/HUDs/Hud.array`) no trae ningún widget "portrait"/"face"/"avatar" suelto, sino
+  `health_bg` (el marco/retrato de fondo -- el candidato más directo a "el personaje") y `health` (la
+  barra) como sub-widgets DENTRO del grupo. El alpha/visible del grupo no se propaga automáticamente a
+  sus hijos (mismo patrón que el joystick: base + knob hijo en +0x160, pero acá los hijos se buscan por
+  NOMBRE en vez de por offset fijo, para no repetir el error de la "espada").
+- **Fix (`source/controls.c`):** resuelto `HudWidget::FindWidgetByName(const char*)` (símbolo
+  `_ZN9HudWidget16FindWidgetByNameEPKc`, confirmado con `nm -D` sobre el `.so` real -- ya usado
+  internamente por el motor en `HudWidget::UpdateTouchInfo` para buscar hijos por nombre). Nueva
+  `force_named_child_shown(parent_widget, name)` que busca el hijo dentro del widget padre y le fuerza
+  visible+active+alpha=255 igual que `force_widget_shown()`. `force_widget_shown()` ahora DEVUELVE el
+  puntero del widget resuelto (antes `void`) para que el caller pueda encadenar la búsqueda de hijos sin
+  re-resolver `Hud::s_pInstance`. Se aplica a `health_bg` Y `health` dentro de `status_healthGroup`.
+- **Validación:** `psvita-toolkit build --preset debug` limpio. `nm` contra `build/sacredodyssey.elf`
+  confirma `force_named_child_shown`/`s_hudwidget_find_widget_by_name`. `eboot.bin`/`sacredodyssey.vpk`
+  regenerados, copiados a raíz, desplegados con `deploy --eboot --yes` (FTP rechazó la primera conexión
+  -- reabrir FTP en VitaShell con SELECT antes de reintentar, patrón recurrente en esta máquina/consola).
+- **FPS:** el usuario confirma "el unico issue que he visto son los FPS erraticos" tras los dos parches
+  de yield (game-objects + graphical-maps) de sesiones anteriores -- ya no hay stalls severos
+  reportados, pero la fluctuación general (picos y valles dentro de una sesión normal, ver logs
+  previos) sigue presente y queda pendiente de una futura sesión dedicada si el usuario lo pide.
+- **Pendiente (consola física):** confirmar que "health_bg" (o "health") es realmente el retrato del
+  personaje y que ahora se ve junto a la barra de vida. Si sigue sin verse, el nombre real del widget
+  portrait podría ser otro no cubierto por el `strings` de `Hud.array` (ej. definido en un `.graphml`/
+  script en vez del `.array`) -- traer un log nuevo con
+  `grep -c "force_named_child_shown\|FindWidgetByName"` no sirve (no logea por diseño, ver código);
+  mejor pedir una captura de pantalla para confirmar visualmente antes de seguir iterando a ciegas.

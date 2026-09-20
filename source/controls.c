@@ -37,6 +37,48 @@ static uintptr_t *s_hud_s_pInstance_ptr = NULL;
 // on these buttons while making them visually unobtrusive.
 static void (*s_animobject_set_alpha)(uintptr_t anim_obj, int alpha) = NULL;
 
+// HudWidget::FindWidgetByName(const char*) -- __thiscall, resuelve un widget
+// HIJO por nombre buscando dentro del subárbol de `this` (confirmado en el
+// pseudo-C: `HudWidget::UpdateTouchInfo` la usa así, `FindWidgetByName((HudWidget*)param_1,
+// "button_YesYes")`, buscando SOLO entre los hijos de `param_1`). Símbolo
+// confirmado presente (`_ZN9HudWidget16FindWidgetByNameEPKc`) vía `nm -D`
+// sobre el .so real. Usado para llegar a los sub-widgets de un widget GRUPO
+// (ej. "status_healthGroup") sin adivinar offsets de hijo a mano -- la misma
+// clase de error que causó el problema de la "espada" (offset equivocado).
+static uintptr_t (*s_hudwidget_find_widget_by_name)(uintptr_t this_widget, const char *name) = NULL;
+
+// 2026-09-19 (usuario): "el joystick derecho no hace nada para mover la
+// camara a diferencia del izquierdo". Causa real (confirmada en el pseudo-C
+// de Ghidra de libsacredodyssey_v106, no adivinada): el update de la camara
+// (funcion decompilada como "Update(int)" sobre lo que resuelve a
+// CameraManager, linea ~102416 de out_ghidra.c) NO llama a
+// CameraRotatePad::Get_MovePad_AxisValues() todos los frames como si hace
+// MoveState::Update() con HudMovePad::Get_MovePad_AxisValues() (ese si es
+// incondicional, por eso el stick izquierdo/movimiento SIEMPRE funciono) --
+// la camara la llama solo `if (*(char*)(widget + 0x1a) != 0)`, donde
+// `widget` es el mismo puntero que HUD_OFFSET_CAMERAPAD ya resuelve desde
+// Hud::s_pInstance (confirmado: `*(Hud**)(Gameplay::s_instance+0x28)` se usa
+// en decenas de sitios como Hud::AddHudMessage/PushIGM, o sea
+// Gameplay::s_instance+0x28 ES Hud::s_pInstance; +8 es exactamente
+// HUD_OFFSET_CAMERAPAD). Ese byte en +0x1a es "hay un touch real encima de
+// este widget ahora mismo" -- lo pone HudWidget::UpdateTouchInfo() (llamado
+// desde CameraRotatePad::UpdateTouchInfo, que es lo que hookeamos abajo) en
+// base a HudEngine::GetTouchPointInfo(), y se resetea a 0 cada frame sin un
+// dedo real encima. Sin un dedo tocando esa zona de pantalla, el gate nunca
+// pasa y nuestro propio hook de Get_MovePad_AxisValues (mas abajo) JAMAS se
+// ejecuta para el stick fisico -- de ahi el "no hace nada" (no es un
+// problema de sensibilidad/deadzone, la funcion ni se llama).
+// Fix: hookear CameraRotatePad::UpdateTouchInfo (NO Get_MovePad_AxisValues,
+// que ya esta bien) para, DESPUES de dejar que la logica real de touch siga
+// funcionando igual que siempre (se llama a HudWidget::UpdateTouchInfo, la
+// clase base, exactamente como el codigo original), forzar ese mismo byte a
+// 1 si el stick derecho fisico esta deflectado este frame -- as[i] el gate
+// pasa y el motor SI llama a Get_MovePad_AxisValues, que ya sabe leer el
+// stick fisico via el "dedo virtual" (s_vcam_cur_x/y mas abajo). No compite
+// con el touch real: si hay un dedo real, el byte ya queda en 1 de por si.
+static void (*s_hudwidget_update_touch_info)(uintptr_t this_ptr, int dt) = NULL;
+static bool s_cam_stick_deflected = false;
+
 // Toggled by the L+R combo (see controls_update) to temporarily bring the
 // dimmed virtual HUD back to full opacity.
 static bool s_hud_full_opacity = false;
@@ -142,7 +184,11 @@ static bool get_widget_pos(enum HudWidgetOffset offset, float *out_x, float *out
 // widget/AnimObject pointers actually resolve (vs. silently no-op'ing every
 // frame via the is_plausible_ptr guards below) -- logged once per offset the
 // first time this runs so the next log settles it instead of assuming.
-#define DIM_ALPHA 18 // ~7% opacity (0-255 scale, confirmed via ASprite::SetAlpha/AnimObject::SetAlpha call sites using 0/0xff as the full range)
+// 2026-09-19 (usuario): "si puedes hazlos mas claros" -- 18 (~7%) dejaba los
+// iconos atenuados casi invisibles; subido a ~16% para que sigan de fondo
+// (los controles fisicos los duplican) pero se puedan distinguir a simple
+// vista en vez de parecer apagados del todo.
+#define DIM_ALPHA 40 // ~16% opacity (0-255 scale, confirmed via ASprite::SetAlpha/AnimObject::SetAlpha call sites using 0/0xff as the full range)
 static int8_t s_dim_logged[128] = {0}; // 0=not yet logged, 1=logged-resolved, 2=logged-unresolved
 static void dim_widget(enum HudWidgetOffset offset, int alpha) {
     bool resolved = false;
@@ -168,6 +214,59 @@ static void dim_widget(enum HudWidgetOffset offset, int alpha) {
 
     if (resolved && s_animobject_set_alpha) {
         s_animobject_set_alpha(anim, alpha);
+    }
+}
+
+// 2026-09-19 (usuario, log_20260919_211800.txt): "veo el menu, pero falta el
+// personaje sobre el menu y el mini mapa de la derecha y la espada sobre el
+// mini mapa" -- forzar alpha=255 (dim_widget arriba) para
+// HEALTH_GROUP/MINI_MAP/SWORD/SYS_IGM no bastó: solo SYS_IGM (menú) se ve.
+// dim_widget() nunca toca "visible"/"active" (offsets +0x18/+0x19,
+// confirmados en is_widget_active() mas abajo) a propósito -- para no
+// interferir con el estado propio del motor. Pero eso significa que si el
+// motor decide, por lo que sea (progreso de tutorial, estado del nivel...),
+// que un widget está con visible=0, ningún alpha lo va a hacer aparecer. El
+// menú SÍ se ve porque probablemente arranca visible=1 por defecto; los
+// otros tres no. Fix: para estos 4 widgets ESPECÍFICOS (los únicos que el
+// usuario pidió mostrar siempre) forzar visible=1 Y active=1 ademas del
+// alpha, cada frame, para garantizar que se dibujen sin importar en que
+// estado los deje el motor. NO se aplica al resto del HUD (dim_widget solo
+// alpha, como hasta ahora) -- son casos puntuales pedidos explícitamente.
+// Returns the resolved widget pointer (or 0) so callers like
+// force_health_portrait_shown() below can reach into its children without
+// re-resolving Hud::s_pInstance a second time.
+static uintptr_t force_widget_shown(enum HudWidgetOffset offset) {
+    if (!s_hud_s_pInstance_ptr || !*s_hud_s_pInstance_ptr) return 0;
+    uintptr_t hud = *s_hud_s_pInstance_ptr;
+    if (!hud || !is_plausible_ptr(hud)) return 0;
+    uintptr_t widget = *(uintptr_t *)(hud + offset);
+    if (!widget || !is_plausible_ptr(widget)) return 0;
+    *(uint8_t *)(widget + 0x18) = 1; // visible
+    *(uint8_t *)(widget + 0x19) = 1; // active
+    dim_widget(offset, 255);
+    return widget;
+}
+
+// 2026-09-20 (usuario, log_20260920_005427.txt): "El personaje al lado de la
+// vida y sobre el boton del menu sigue oculto" -- pese a force_widget_shown()
+// en HUD_OFFSET_HEALTH_GROUP (status_healthGroup). Causa probable: el string
+// dump de data/menus/HUDs/Hud.array (`strings` sobre el .array real) no trae
+// ningún widget "portrait"/"face"/"avatar" -- "status_healthGroup" es un
+// widget GRUPO cuyos hijos reales son "health_bg" (el marco/retrato de
+// fondo -- lo más probable candidato al "personaje" que describe el
+// usuario) y "health" (la barra en sí). Mismo patrón que el joystick
+// (base + knob hijo en +0x160), pero acá se resuelve por NOMBRE vía
+// HudWidget::FindWidgetByName en vez de adivinar un offset de hijo a mano
+// -- la lección de la "espada" (offset equivocado) de la sesión anterior.
+static void force_named_child_shown(uintptr_t parent_widget, const char *name) {
+    if (!parent_widget || !is_plausible_ptr(parent_widget) || !s_hudwidget_find_widget_by_name) return;
+    uintptr_t child = s_hudwidget_find_widget_by_name(parent_widget, name);
+    if (!child || !is_plausible_ptr(child)) return;
+    *(uint8_t *)(child + 0x18) = 1; // visible
+    *(uint8_t *)(child + 0x19) = 1; // active
+    uintptr_t anim = *(uintptr_t *)(child + 4);
+    if (anim && is_plausible_ptr(anim) && s_animobject_set_alpha) {
+        s_animobject_set_alpha(anim, 255);
     }
 }
 
@@ -244,6 +343,20 @@ static void hook_HudMovePad_Get_MovePad_AxisValues(float *out, uintptr_t this_pt
 }
 
 // Hook for CameraRotatePad::Get_MovePad_AxisValues (Right Analog Stick)
+//
+// 2026-09-18: el stick derecho sumaba hasta 8.5 "px" por llamada mientras un
+// dedo real produce deltas acumulados de cientos de px -- se sentia lento e
+// impreciso al lado del tactil. Nuevo enfoque: dedo VIRTUAL. Cuando el stick
+// se deflecta se integra su velocidad en un drag (origen + posicion actual
+// persistentes entre llamadas) y se emite `cur - start`, EXACTAMENTE la misma
+// magnitud que el path tactil de arriba (`cur_x - start_x`). Asi el motor
+// aplica al stick sus propias curvas/sensibilidad de dedo sin que este port
+// tenga que adivinarlas: por construccion se mueve igual que un dedo, con
+// precision fina cerca del centro (norm pequeno -> fracciones de px, out es
+// float). Al centrar el stick se "levanta el dedo" (reset); el tactil real
+// sigue mandando por su propio path y no se toca memoria del engine (solo
+// out[]), asi que ambos pueden convivir sin corromper estado.
+static float s_vcam_cur_x = 0.0f, s_vcam_cur_y = 0.0f;
 static void hook_CameraRotatePad_Get_MovePad_AxisValues(float *out, uintptr_t this_ptr) {
     out[0] = 0.0f;
     out[1] = 0.0f;
@@ -261,19 +374,55 @@ static void hook_CameraRotatePad_Get_MovePad_AxisValues(float *out, uintptr_t th
         }
     }
 
-    // 2. Physical Right Analog Stick
+    // 2. Physical Right Analog Stick as a virtual finger drag
     float rx = (g_pad.rx - 128) / 128.0f;
     float ry = (g_pad.ry - 128) / 128.0f;
     float r_len = sqrtf(rx * rx + ry * ry);
-    const float deadzone = 0.18f;
+    const float deadzone = 0.12f;
 
     if (r_len > deadzone) {
         float norm = (r_len - deadzone) / (1.0f - deadzone);
         if (norm > 1.0f) norm = 1.0f;
-        // Sensitivity tuned for smooth, responsive console camera control
-        const float camera_sensitivity = 8.5f;
-        out[0] += (rx / r_len) * norm * camera_sensitivity;
-        out[1] += (ry / r_len) * norm * camera_sensitivity;
+        // Px por llamada a deflection maxima: a 60 fps son ~720 px/s, un
+        // swipe rapido de dedo; cerca del centro, fracciones de px.
+        const float px_per_call = 12.0f;
+        s_vcam_cur_x += (rx / r_len) * norm * px_per_call;
+        s_vcam_cur_y += (ry / r_len) * norm * px_per_call;
+        // Clamp como los bordes de pantalla de un drag real: evita deriva
+        // infinita si se deja el stick pisado mucho rato.
+        if (s_vcam_cur_x >  500.0f) s_vcam_cur_x =  500.0f;
+        if (s_vcam_cur_x < -500.0f) s_vcam_cur_x = -500.0f;
+        if (s_vcam_cur_y >  500.0f) s_vcam_cur_y =  500.0f;
+        if (s_vcam_cur_y < -500.0f) s_vcam_cur_y = -500.0f;
+        out[0] += s_vcam_cur_x; // start virtual = (0,0): out = cur - start
+        out[1] += s_vcam_cur_y;
+    } else {
+        // Stick centrado = dedo levantado: el proximo deflect resetea el
+        // drag desde cero en vez de heredar un salto discontinuo.
+        s_vcam_cur_x = 0.0f;
+        s_vcam_cur_y = 0.0f;
+    }
+}
+
+// Hook for CameraRotatePad::UpdateTouchInfo(int) -- ver el comentario largo
+// junto a s_hudwidget_update_touch_info mas arriba para la causa raiz. Llama
+// PRIMERO a la implementacion real (mismo orden que el codigo original:
+// acumular el timer de doble-tap propio de CameraRotatePad y despues
+// delegar a HudWidget::UpdateTouchInfo, la clase base, que es quien de
+// verdad calcula +0x1a a partir del touch real), y SOLO DESPUES pisa +0x1a
+// a 1 si el stick fisico esta deflectado -- nunca antes, para no pisar ni
+// competir con el resultado real del touch en el mismo frame.
+static void hook_CameraRotatePad_UpdateTouchInfo(uintptr_t this_ptr, int dt) {
+    if (!this_ptr || !is_plausible_ptr(this_ptr)) return;
+
+    *(int *)(this_ptr + 0x174) += dt; // double-tap timer, igual que el original
+
+    if (s_hudwidget_update_touch_info) {
+        s_hudwidget_update_touch_info(this_ptr, dt);
+    }
+
+    if (s_cam_stick_deflected) {
+        *(uint8_t *)(this_ptr + 0x1a) = 1;
     }
 }
 
@@ -307,12 +456,42 @@ void controls_init(so_touch_fn touch_fn, so_key_fn key_down_fn, so_key_fn key_up
         l_warn("Could not find CameraRotatePad::Get_MovePad_AxisValues to hook");
     }
 
+    // 2026-09-19: sin esto el stick derecho fisico no hacia NADA -- ver el
+    // comentario largo junto a s_hudwidget_update_touch_info. Resolver la
+    // base class (llamada, no hookeada) y hookear el override de
+    // CameraRotatePad para forzar el gate de "touch activo" que el update
+    // de la camara chequea antes de llamar a Get_MovePad_AxisValues.
+    uintptr_t hudwidget_touch_sym = so_symbol(&so_mod, "_ZN9HudWidget15UpdateTouchInfoEi");
+    if (hudwidget_touch_sym) {
+        s_hudwidget_update_touch_info = (void (*)(uintptr_t, int))hudwidget_touch_sym;
+        l_info("Resolved HudWidget::UpdateTouchInfo successfully");
+    } else {
+        l_warn("Could not resolve HudWidget::UpdateTouchInfo -- right stick camera fix disabled");
+    }
+
+    uintptr_t camerapad_touch_sym = so_symbol(&so_mod, "_ZN15CameraRotatePad15UpdateTouchInfoEi");
+    if (camerapad_touch_sym) {
+        hook_addr(camerapad_touch_sym, (uintptr_t)&hook_CameraRotatePad_UpdateTouchInfo);
+        l_info("Hooked CameraRotatePad::UpdateTouchInfo successfully");
+    } else {
+        l_warn("Could not find CameraRotatePad::UpdateTouchInfo to hook -- right stick camera fix disabled");
+    }
+
     // Resolve pointer to Hud::s_pInstance
     s_hud_s_pInstance_ptr = (uintptr_t *)so_symbol(&so_mod, "_ZN3Hud11s_pInstanceE");
     if (s_hud_s_pInstance_ptr) {
         l_info("Resolved Hud::s_pInstance symbol successfully");
     } else {
         l_warn("Could not resolve Hud::s_pInstance");
+    }
+
+    // Resolve HudWidget::FindWidgetByName(const char*) for force_named_child_shown().
+    uintptr_t find_child_sym = so_symbol(&so_mod, "_ZN9HudWidget16FindWidgetByNameEPKc");
+    if (find_child_sym) {
+        s_hudwidget_find_widget_by_name = (uintptr_t (*)(uintptr_t, const char *))find_child_sym;
+        l_info("Resolved HudWidget::FindWidgetByName successfully");
+    } else {
+        l_warn("Could not resolve HudWidget::FindWidgetByName -- health portrait fix disabled");
     }
 
     // Resolve AnimObject::SetAlpha(int) for dim_widget() (see its comment).
@@ -335,17 +514,28 @@ void controls_update(void) {
     uint32_t pressed = s_current_buttons & ~s_old_buttons;
     uint32_t released = ~s_current_buttons & s_old_buttons;
 
+    // Snapshot para hook_CameraRotatePad_UpdateTouchInfo (ver su comentario):
+    // controls_update() corre ANTES de nativeGameRendererRender() en el loop
+    // de main.c, asi que este valor ya esta listo para cuando ese hook (y
+    // despues CameraManager::Update) lo lean mas adelante en el mismo frame.
+    // Mismo deadzone que hook_CameraRotatePad_Get_MovePad_AxisValues.
+    {
+        float rx = (g_pad.rx - 128) / 128.0f;
+        float ry = (g_pad.ry - 128) / 128.0f;
+        s_cam_stick_deflected = (rx * rx + ry * ry) > (0.12f * 0.12f);
+    }
+
     // L+R combo (both bumpers held together, edge-triggered so holding them
     // doesn't flicker every frame) toggles the dimmed virtual HUD back to
     // full opacity -- user-requested way to see (or touch-tap directly) the
-    // joystick, the action buttons, AND the top menu (HUD_OFFSET_SYS_IGM,
-    // left cluster)/sword (HUD_OFFSET_SWITCH_WEAPON/SWORD, right cluster)
-    // icons, distinct from the bottom attack sword (HUD_OFFSET_ATTACK,
-    // fixed-coordinate Cross tap, never dimmed differently from the rest of
-    // this list -- there is no separate "bottom sword" widget in this set to
-    // confuse it with). Also fires the L-Trigger/R-Trigger shield+horse taps
-    // simultaneously (both are still physical buttons in their own right) --
-    // accepted trade-off of reusing L+R for this secondary function.
+    // joystick and the remaining dimmed action buttons (attack/shield/horse/
+    // switch-weapon/bomb/box/npc/treasure/mirror/Iron*/tutorial). Does NOT
+    // affect status_healthGroup/Mini_Map/button_toSysIGM/button_sword (menu
+    // icon + top-right sword) -- those are forced to full opacity every
+    // frame regardless of this toggle (2026-09-19, ver mas abajo). Also
+    // fires the L-Trigger/R-Trigger shield+horse taps simultaneously (both
+    // are still physical buttons in their own right) -- accepted trade-off
+    // of reusing L+R for this secondary function.
     {
         bool lr_now = (g_pad.buttons & SCE_CTRL_LTRIGGER) && (g_pad.buttons & SCE_CTRL_RTRIGGER);
         bool lr_before = (s_old_buttons & SCE_CTRL_LTRIGGER) && (s_old_buttons & SCE_CTRL_RTRIGGER);
@@ -364,16 +554,70 @@ void controls_update(void) {
     dim_movepad(hud_alpha);
     dim_widget(HUD_OFFSET_CAMERAPAD, hud_alpha);
     dim_widget(HUD_OFFSET_ATTACK, hud_alpha);
-    dim_widget(HUD_OFFSET_SWORD, hud_alpha);
     dim_widget(HUD_OFFSET_DEFENSE, hud_alpha);
     dim_widget(HUD_OFFSET_BLOCK, hud_alpha);
     dim_widget(HUD_OFFSET_CHANGE_HORSE, hud_alpha);
     dim_widget(HUD_OFFSET_CHANGE_RUN, hud_alpha);
     dim_widget(HUD_OFFSET_TARGET_CROSS, hud_alpha);
-    dim_widget(HUD_OFFSET_MINI_MAP, hud_alpha);
-    dim_widget(HUD_OFFSET_SYS_IGM, hud_alpha);
     dim_widget(HUD_OFFSET_IGM, hud_alpha);
-    dim_widget(HUD_OFFSET_SWITCH_WEAPON, hud_alpha);
+    // 2026-09-20 (usuario, log_20260920_000922.txt): "agregaste una espada...
+    // no era agregarla sino ponerle la opacidad completa" -- HUD_OFFSET_SWORD
+    // (offset 56, "button_sword") resultó ser un widget que el motor NO
+    // muestra en gameplay normal; forzarlo visible+active lo hacía aparecer
+    // como un ícono ajeno/nuevo, no como el ícono de espada tenue que el
+    // usuario ya veía. Ese ícono real es button_switchWeapon (offset 52, el
+    // que de verdad se renderiza -- ya se usa para el tap sintético de
+    // SELECT más abajo), agrupado con SWORD como "cluster derecho" en
+    // comentarios de sesiones viejas sin verificar cuál de los dos era. Se
+    // revierte: SWORD vuelve a la lista atenuada de abajo (el motor
+    // igualmente no lo muestra, así que atenuarlo no cambia nada visible) y
+    // SWITCH_WEAPON pasa a opacidad completa (ver más abajo) -- solo alpha,
+    // sin tocar visible/active, tal como pidió el usuario.
+    dim_widget(HUD_OFFSET_SWORD, hud_alpha);
+    // 2026-09-19 (usuario): iconos contextuales inferiores (bomba/caja/NPC/
+    // tesoro/espejo/especiales Iron*/tutorial) nunca estaban en esta lista --
+    // se mostraban a la opacidad default del motor, inconsistente con "el
+    // resto" que el usuario pide mantener discreto. Se atenuan igual que el
+    // resto del HUD inferior (el toque real sigue funcionando, dim_widget
+    // solo tocá alpha, no el flag visible/active).
+    dim_widget(HUD_OFFSET_PICK_BOMB, hud_alpha);
+    dim_widget(HUD_OFFSET_PUSH_BOX, hud_alpha);
+    dim_widget(HUD_OFFSET_TALK_NPC, hud_alpha);
+    dim_widget(HUD_OFFSET_OPEN_TREASURE, hud_alpha);
+    dim_widget(HUD_OFFSET_ROTATE_MIRROR, hud_alpha);
+    dim_widget(HUD_OFFSET_IRON_EAGLE, hud_alpha);
+    dim_widget(HUD_OFFSET_IRON_FIST, hud_alpha);
+    dim_widget(HUD_OFFSET_IRON_CHAIN, hud_alpha);
+    dim_widget(HUD_OFFSET_TUTORIAL_DLG, hud_alpha);
+    // 2026-09-18 (usuario): los elementos SUPERIORES -- retrato/vida del
+    // personaje (status_healthGroup, arriba-izquierda) y Mini_Map
+    // (arriba-derecha) -- deben mostrarse siempre a opacidad completa, no
+    // atenuarse con el resto del HUD. Se restauran a 255 cada frame (tambien
+    // pisa cualquier dimming propio del motor).
+    // 2026-09-19 (usuario): "mostrar el icono del menu ... y la espada
+    // superior derecha" -- se suman button_toSysIGM (icono de menu, cluster
+    // izquierdo) y button_sword (espada, cluster derecho) a la lista de
+    // opacidad completa; salen de la lista dim de arriba.
+    // 2026-09-19 (segunda vuelta, usuario): "veo el menu, pero falta el
+    // personaje... el mini mapa" -- forzar solo alpha (255) no bastaba
+    // porque el motor tenia estos widgets con visible=0 (el menu arrancaba
+    // visible=1 de por si, por eso ese SI se veia). Ahora se fuerza
+    // visible+active+alpha (ver force_widget_shown()).
+    uintptr_t health_group_widget = force_widget_shown(HUD_OFFSET_HEALTH_GROUP);
+    // 2026-09-20 (usuario): "el personaje al lado de la vida... sigue
+    // oculto" -- status_healthGroup es un widget GRUPO; su propio alpha no
+    // alcanza a los hijos reales "health_bg" (el retrato/marco -- candidato
+    // al "personaje") y "health" (la barra), resueltos por nombre dentro de
+    // este grupo especifico (ver force_named_child_shown()).
+    force_named_child_shown(health_group_widget, "health_bg");
+    force_named_child_shown(health_group_widget, "health");
+    force_widget_shown(HUD_OFFSET_MINI_MAP);
+    force_widget_shown(HUD_OFFSET_SYS_IGM);
+    // 2026-09-20 (usuario): la espada real (button_switchWeapon, ver el
+    // comentario junto a HUD_OFFSET_SWORD mas arriba) SI se renderiza en
+    // gameplay normal (por eso alpha=255 solo alcanza, sin necesitar
+    // force_widget_shown/visible/active como los de arriba).
+    dim_widget(HUD_OFFSET_SWITCH_WEAPON, 255);
 
     // Menu Key Events:
     // START -> KEYCODE_BACK (4) / Menu

@@ -79,33 +79,91 @@ static int shader_is_substituted(GLuint shader) {
 // telemetry functions below log unconditionally (bypassing their caps) for
 // just these specific watched programs -- targeted, not a blanket raise of
 // the caps (which would spam the log for the rest of a real session).
-#define MAX_WATCHED 16
+// 2026-09-18 (tercera vuelta): con el cap en 16, log_20260918_152457.txt
+// (build recien desplegado con la telemetria de [gl_draw]) confirmo el cap
+// alcanzado justo en el shader #78 (16avo watch_shader() exitoso) -- shaders
+// #79/#80, que son EXACTAMENTE los del programa 40 (TEXTURESKINNED, el
+// material `KnightsOdyssey_hand_diffuse` que la sesion anterior identifico
+// con "Unused parameter: Map__3__..."), imprimieron el log "flagged" (el
+// l_info corria incondicional, sin chequear si watch_shader() realmente
+// guardo el slot) pero NUNCA entraron a la tabla -- watch_shader() los
+// descartaba en silencio con el array lleno. glAttachShader_soloader nunca
+// vio shader_is_watched(79/80)==true, asi que el programa 40 nunca se marco
+// watched, y [gl_draw] (que solo logea para watch_program_is_watched()) no
+// disparo NI UNA VEZ para el material que mas hace falta ver. 16 ya no
+// alcanza para una mision real (18 shaders distintos calificaron en esta
+// sola sesion, con margen de sobra para que una escena mas larga pida mas)
+// -- subido a 64 (256 bytes extra, nada) y watch_shader()/watch_program()
+// ahora devuelven si el slot se guardo de verdad, para que el log de arriba
+// dejen de mentir si el array se llena otra vez.
+#define MAX_WATCHED 64
 static GLuint s_watched_shaders[MAX_WATCHED];
 static int s_watched_shader_count;
 static GLuint s_watched_programs[MAX_WATCHED];
 static int s_watched_program_count;
 
-static void watch_shader(GLuint shader) {
-    for (int i = 0; i < s_watched_shader_count; i++) if (s_watched_shaders[i] == shader) return;
-    if (s_watched_shader_count < MAX_WATCHED) s_watched_shaders[s_watched_shader_count++] = shader;
+static int watch_shader(GLuint shader) {
+    for (int i = 0; i < s_watched_shader_count; i++) if (s_watched_shaders[i] == shader) return 1;
+    if (s_watched_shader_count < MAX_WATCHED) {
+        s_watched_shaders[s_watched_shader_count++] = shader;
+        return 1;
+    }
+    return 0;
 }
 static int shader_is_watched(GLuint shader) {
     for (int i = 0; i < s_watched_shader_count; i++) if (s_watched_shaders[i] == shader) return 1;
     return 0;
 }
-static void watch_program(GLuint program) {
-    for (int i = 0; i < s_watched_program_count; i++) if (s_watched_programs[i] == program) return;
-    if (s_watched_program_count < MAX_WATCHED) s_watched_programs[s_watched_program_count++] = program;
+static int watch_program(GLuint program) {
+    for (int i = 0; i < s_watched_program_count; i++) if (s_watched_programs[i] == program) return 1;
+    if (s_watched_program_count < MAX_WATCHED) {
+        s_watched_programs[s_watched_program_count++] = program;
+        return 1;
+    }
+    return 0;
 }
 static int program_is_watched(GLuint program) {
     for (int i = 0; i < s_watched_program_count; i++) if (s_watched_programs[i] == program) return 1;
     return 0;
 }
 
+// 2026-09-19 (usuario): "bajones de FPS al luchar con el jefe cuando se cae
+// por una explosion al igual que al pasar a otros stage". La telemetria
+// [gl_u4v]/[gl_u1i]/[gl_u1f] de la sesion anterior (commit "diag: telemetria
+// dirigida a programas MULTITEXTURED+SKINNED") logea SIN LIMITE cada llamada
+// a glUniform* para CUALQUIER programa watched (personaje/caballo/jefe: los
+// 13 materiales MULTITEXTURED del dataset) durante el resto de la sesion --
+// cada l_info() que llega a los sinks de archivo/UDP hace un sceIoOpen+Write+
+// Close y un sendto bloqueantes (ver logger.c). Un pelea contra el jefe
+// dibuja al jugador+montura+jefe cada frame, cada uno con varios uniforms
+// (DiffuseColor/envmapIntensity/Sampler0/Sampler1/matrices de hueso) -- eso
+// es de a decenas de estas llamadas SIN throttle, 60 veces por segundo,
+// mientras dura el combate. log_watched_draw_state() (mas abajo) ya limita a
+// 3 logs por programa; estas 5 wrappers de glUniform* no tenian ningun cap
+// equivalente. Presupuesto generoso (30 por programa) alcanza para la misma
+// evidencia de diagnostico que ya se uso (confirmar Sampler1/envmapIntensity
+// en los primeros draws de cada material) sin pagar el costo el resto del
+// combate/mision.
+#define MAX_WATCHED_UNIFORM_LOGS 30
+static unsigned s_watched_uniform_log_count[MAX_WATCHED];
+static int watched_uniform_log_budget(GLuint program) {
+    for (int i = 0; i < s_watched_program_count; i++) {
+        if (s_watched_programs[i] == program) {
+            if (s_watched_uniform_log_count[i] >= MAX_WATCHED_UNIFORM_LOGS) return 0;
+            s_watched_uniform_log_count[i]++;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 void glAttachShader_soloader(GLuint program, GLuint shader) {
     if (shader_is_watched(shader)) {
-        watch_program(program);
-        l_info("[gl_watch] program %u <- watched shader %u (MULTITEXTURED+SKINNED)", program, shader);
+        if (watch_program(program)) {
+            l_info("[gl_watch] program %u <- watched shader %u (MULTITEXTURED+SKINNED)", program, shader);
+        } else {
+            l_warn("[gl_watch] program %u <- watched shader %u, but MAX_WATCHED programs already full!", program, shader);
+        }
     }
     glAttachShader(program, shader);
 }
@@ -222,8 +280,11 @@ void glShaderSource_soloader(GLuint shader, GLsizei count,
     str[total_length] = '\0';
 
     if (strstr(str, "MULTITEXTURED") && strstr(str, "SKINNED")) {
-        watch_shader(shader);
-        l_info("[gl_watch] shader #%u flagged (MULTITEXTURED+SKINNED technique)", shader);
+        if (watch_shader(shader)) {
+            l_info("[gl_watch] shader #%u flagged (MULTITEXTURED+SKINNED technique)", shader);
+        } else {
+            l_warn("[gl_watch] shader #%u matched, but MAX_WATCHED shaders already full!", shader);
+        }
     }
 
     // Empty shader sources (missing data/3d/effects/*.glsl + missing .obfs
@@ -471,10 +532,15 @@ void glUseProgram_soloader(GLuint program) {
 
 static int interesting_uniform(const char *name) {
     if (!name) return 0;
-    return strstr(name, "Sampler") != NULL || strstr(name, "Diffuse") != NULL ||
-           strstr(name, "envmap") != NULL || strstr(name, "TextureMatrix") != NULL ||
-           strstr(name, "Bone") != NULL || strstr(name, "Weight") != NULL ||
-           strstr(name, "texture") != NULL;
+    // 2026-09-18: el binder nombra sus params por material
+    // ("Map__3__KnightsOdyssey_hand_diffuse.tga_-sampler", minusculas):
+    // el match anterior ("Sampler" con mayuscula) los dejaba pasar sin
+    // loguear ni una vez. Se matchea tambien "sampler" y "Map__".
+    return strstr(name, "Sampler") != NULL || strstr(name, "sampler") != NULL ||
+            strstr(name, "Map__") != NULL || strstr(name, "Diffuse") != NULL ||
+            strstr(name, "envmap") != NULL || strstr(name, "TextureMatrix") != NULL ||
+            strstr(name, "Bone") != NULL || strstr(name, "Weight") != NULL ||
+            strstr(name, "texture") != NULL;
 }
 
 GLint glGetUniformLocation_soloader(GLuint program, const GLchar *name) {
@@ -486,27 +552,185 @@ GLint glGetUniformLocation_soloader(GLuint program, const GLchar *name) {
     return loc;
 }
 
+// vitaGL doesn't implement glGetUniformfv/glGetUniformiv (no uniform
+// readback API at all -- confirmed absent from vitaGL.h), so the draw-time
+// telemetry below can't ask the GPU "what value does this uniform hold right
+// now". Instead, remember which (program, location) pairs a glUniform4fv/1i
+// call has EVER touched for a watched program -- small fixed table, these
+// programs only have a handful of distinct uniform locations.
+#define MAX_SEEN_UNIFORMS 32
+static GLint s_seen_uniform_prog[MAX_SEEN_UNIFORMS];
+static GLint s_seen_uniform_loc[MAX_SEEN_UNIFORMS];
+static int s_seen_uniform_count;
+
+static void mark_uniform_set(GLuint program, GLint location) {
+    for (int i = 0; i < s_seen_uniform_count; i++) {
+        if (s_seen_uniform_prog[i] == (GLint)program && s_seen_uniform_loc[i] == location) return;
+    }
+    if (s_seen_uniform_count < MAX_SEEN_UNIFORMS) {
+        s_seen_uniform_prog[s_seen_uniform_count] = (GLint)program;
+        s_seen_uniform_loc[s_seen_uniform_count] = location;
+        s_seen_uniform_count++;
+    }
+}
+
+static int uniform_was_ever_set(GLuint program, GLint location) {
+    if (location < 0) return -1; // uniform doesn't exist in this program at all
+    for (int i = 0; i < s_seen_uniform_count; i++) {
+        if (s_seen_uniform_prog[i] == (GLint)program && s_seen_uniform_loc[i] == location) return 1;
+    }
+    return 0;
+}
+
 void glUniform4fv_soloader(GLint location, GLsizei count, const GLfloat *value) {
     // vec4 uploads are DiffuseColor / material colors / bone rows: log the
     // first ones per run (with current program for correlation) to catch a
     // materialeo uploading black. Watched programs (see watch_program())
     // always log, uncapped -- the generic cap exhausts long before the
     // character/horse materials link in a real session.
-    if (value && count >= 1 && (u4v_logged < 25 || program_is_watched(cur_program))) {
+    if (value && count >= 1 && (u4v_logged < 25 || watched_uniform_log_budget(cur_program))) {
         if (!program_is_watched(cur_program)) u4v_logged++;
         l_info("[gl_u4v] prog=%u loc=%d count=%d v=(%.3f,%.3f,%.3f,%.3f)",
                cur_program, location, count, value[0], value[1], value[2], value[3]);
     }
+    if (program_is_watched(cur_program)) mark_uniform_set(cur_program, location);
     glUniform4fv(location, count, value);
 }
 
 void glUniform1i_soloader(GLint location, GLint v0) {
     // Sampler->unit assignments (+ BoneTexture unit for TEXTURESKINNED).
-    if (u1i_logged < 40 || program_is_watched(cur_program)) {
+    if (u1i_logged < 40 || watched_uniform_log_budget(cur_program)) {
         if (!program_is_watched(cur_program)) u1i_logged++;
         l_info("[gl_u1i] prog=%u loc=%d unit=%d", cur_program, location, v0);
     }
+    if (program_is_watched(cur_program)) mark_uniform_set(cur_program, location);
     glUniform1i(location, v0);
+}
+
+// 2026-09-18: el binder del motor tambien puede usar las variantes
+// vector/escalar (1iv para samplers, 1f para envmapIntensity, 4f para
+// DiffuseColor) -- antes pasaban en crudo sin marcar ever_set, asi que el
+// [gl_draw] reportaba "nunca seteado" aunque el bind fuera real. Mismo
+// tratamiento que sus hermanas 1i/4fv: log + marca + call-through.
+void glUniform1iv_soloader(GLint location, GLsizei count, const GLint *value) {
+    if ((value && count >= 1 && (u1i_logged < 40 || watched_uniform_log_budget(cur_program)))) {
+        if (!program_is_watched(cur_program)) u1i_logged++;
+        l_info("[gl_u1i] prog=%u loc=%d unit=%d (1iv,count=%d)", cur_program, location, value[0], count);
+    }
+    if (program_is_watched(cur_program)) mark_uniform_set(cur_program, location);
+    glUniform1iv(location, count, value);
+}
+
+void glUniform1f_soloader(GLint location, GLfloat v0) {
+    // Típicamente envmapIntensity en materiales MULTITEXTURED (personaje,
+    // montura): loguear el valor confirma que el aditivo nuevo recibe la
+    // intensidad real del material en vez del default GL 0.0.
+    if (u1i_logged < 40 || watched_uniform_log_budget(cur_program)) {
+        if (!program_is_watched(cur_program)) u1i_logged++;
+        l_info("[gl_u1f] prog=%u loc=%d v=%.3f", cur_program, location, v0);
+    }
+    if (program_is_watched(cur_program)) mark_uniform_set(cur_program, location);
+    glUniform1f(location, v0);
+}
+
+void glUniform4f_soloader(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3) {
+    if (u4v_logged < 25 || watched_uniform_log_budget(cur_program)) {
+        if (!program_is_watched(cur_program)) u4v_logged++;
+        l_info("[gl_u4v] prog=%u loc=%d count=1 v=(%.3f,%.3f,%.3f,%.3f) (4f)",
+               cur_program, location, v0, v1, v2, v3);
+    }
+    if (program_is_watched(cur_program)) mark_uniform_set(cur_program, location);
+    glUniform4f(location, v0, v1, v2, v3);
+}
+
+// 2026-09-18 (segunda vuelta): [gl_u4v]/[gl_u1i] arriba nunca dispararon NI
+// UNA VEZ para los programas 34-40 en TODA la sesion (grep -c "gl_u4v\]\|
+// gl_u1i\]" contra log_20260918_011317.txt = 6/12 total, ninguno prog>=17) --
+// pese a que el personaje/caballo SI se dibujan en pantalla ("silueta" negra
+// pero con forma correcta, confirmado por el usuario). Conclusion: el binder
+// de parametros del motor jamas llama glUniform4fv/1i para este material en
+// absoluto (no es un problema de nombre-no-matchea como Sampler1/Map__N__ --
+// eso a lo sumo explicaria UN parametro faltante, no CERO llamadas para TODO
+// el material, incluido DiffuseColor que si resuelve su location por nombre
+// en [gl_bind]). La telemetria pasiva (observar los SET calls) se agoto sin
+// evidencia. Este bloque en cambio CONSULTA el estado real en el momento del
+// draw call. vitaGL no implementa glGetUniformfv/iv (sin API de lectura de
+// uniforms -- confirmado ausente de vitaGL.h, el link fallaba por simbolo
+// indefinido), asi que en vez de leer el valor actual de la GPU, mark_uniform_set()
+// (arriba) registra cada (program,location) que un glUniform4fv/1i real haya
+// tocado; uniform_was_ever_set() consulta ese registro en el draw call --
+// suficiente para responder "esto quedo en su default GL de fabrica (0) o
+// alguna vez se seteo", sin necesitar leerlo de vuelta. Cubre tambien el
+// texture binding real (que unidad esta activa, que textura hay bindeada en
+// las primeras unidades) porque glActiveTexture/glBindTexture nunca se
+// hookearon: si Sampler0 vale 0 (su default GL sin setear) pero la unidad 0
+// NO tiene la textura difusa correcta bindeada en el momento del draw, el
+// resultado es negro sin que ninguna de las dos mitades (uniform o bind) sea
+// "el culpable" por si sola.
+static GLuint s_active_texture_unit = GL_TEXTURE0;
+#define MAX_TRACKED_TEX_UNITS 8
+static GLuint s_bound_texture[MAX_TRACKED_TEX_UNITS];
+
+void glActiveTexture_soloader(GLenum texture) {
+    unsigned idx = texture - GL_TEXTURE0;
+    if (idx < MAX_TRACKED_TEX_UNITS) s_active_texture_unit = texture;
+    glActiveTexture(texture);
+}
+
+void glBindTexture_soloader(GLenum target, GLuint texture) {
+    unsigned idx = s_active_texture_unit - GL_TEXTURE0;
+    if (target == GL_TEXTURE_2D && idx < MAX_TRACKED_TEX_UNITS) {
+        s_bound_texture[idx] = texture;
+    }
+    glBindTexture(target, texture);
+}
+
+#define MAX_DRAW_LOGGED_PROGRAMS 16
+static GLuint s_draw_logged_program[MAX_DRAW_LOGGED_PROGRAMS];
+static unsigned s_draw_logged_count[MAX_DRAW_LOGGED_PROGRAMS];
+static int s_draw_logged_program_n;
+
+static void log_watched_draw_state(const char *caller) {
+    if (!program_is_watched(cur_program)) return;
+
+    int slot = -1;
+    for (int i = 0; i < s_draw_logged_program_n; i++) {
+        if (s_draw_logged_program[i] == cur_program) { slot = i; break; }
+    }
+    if (slot < 0) {
+        if (s_draw_logged_program_n >= MAX_DRAW_LOGGED_PROGRAMS) return;
+        slot = s_draw_logged_program_n++;
+        s_draw_logged_program[slot] = cur_program;
+        s_draw_logged_count[slot] = 0;
+    }
+    // 3 logs por programa alcanzan para confirmar si el valor es estable
+    // entre draws sin inundar el log en una mission entera.
+    if (s_draw_logged_count[slot] >= 3) return;
+    s_draw_logged_count[slot]++;
+
+    GLint diffuse_loc = glGetUniformLocation(cur_program, "DiffuseColor");
+    GLint sampler0_loc = glGetUniformLocation(cur_program, "Sampler0");
+    // -1 = uniform doesn't exist in this program; 0 = exists but glUniform*
+    // never touched it (still holds GL's zero-initialized default); 1 = some
+    // glUniform4fv/1i call set it at least once (see mark_uniform_set above).
+    int diffuse_set = uniform_was_ever_set(cur_program, diffuse_loc);
+    int sampler0_set = uniform_was_ever_set(cur_program, sampler0_loc);
+
+    l_info("[gl_draw] %s prog=%u DiffuseColor(loc=%d,ever_set=%d) "
+           "Sampler0(loc=%d,ever_set=%d) active_unit=%u tex@unit0=%u tex@unit1=%u",
+           caller, cur_program, diffuse_loc, diffuse_set,
+           sampler0_loc, sampler0_set, s_active_texture_unit - GL_TEXTURE0,
+           s_bound_texture[0], s_bound_texture[1]);
+}
+
+void glDrawArrays_soloader(GLenum mode, GLint first, GLsizei count) {
+    log_watched_draw_state("glDrawArrays");
+    glDrawArrays(mode, first, count);
+}
+
+void glDrawElements_soloader(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices) {
+    log_watched_draw_state("glDrawElements");
+    glDrawElements(mode, count, type, indices);
 }
 
 // --- Viewport/scissor rescale (sin FBO) -----------------------------------

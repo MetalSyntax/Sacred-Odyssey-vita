@@ -337,6 +337,15 @@ typedef struct {
     char path[256];
     unsigned char *data;
     long size;
+    unsigned last_used; // s_fcache_clock snapshot; LRU eviction key
+    // 2026-09-18: 1 = invalidada por una apertura de escritura posterior
+    // (ver fcache_invalidate). Los handles ya abiertos siguen leyendo sus
+    // bytes viejos (como un fd abierto tras unlink en cualquier OS); las
+    // aperturas NUEVAS la saltan y van a disco. Sin este flag, invalidar
+    // liberaba bajo handles abiertos (use-after-free) o los re-apuntaba a
+    // otro archivo (swap-with-last) -- corrupcion de datos en el parse del
+    // engine justo en autoguardado/transicion de stage.
+    int stale;
 } FCacheEntry;
 
 typedef struct {
@@ -347,6 +356,7 @@ typedef struct {
 static FCacheEntry s_fcache_entries[FCACHE_MAX_ENTRIES];
 static int s_fcache_entry_count = 0;
 static long s_fcache_total_bytes = 0;
+static unsigned s_fcache_clock = 0;
 static FCacheHandle s_fcache_handles[FCACHE_MAX_HANDLES];
 static int s_fcache_handles_init = 0;
 static pthread_mutex_t s_fcache_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -374,16 +384,92 @@ static int fcache_find_entry_locked(const char *path) {
     return -1;
 }
 
+// Como fcache_find_entry_locked pero salta entradas stale (invalidadas por
+// escritura posterior): solo BAJO lock. Usado por el hit-path de fopen y el
+// chequeo de duplicados de populate, para que una apertura nueva nunca vea
+// bytes viejos.
+static int fcache_find_valid_entry_locked(const char *path) {
+    for (int i = 0; i < s_fcache_entry_count; i++) {
+        if (!s_fcache_entries[i].stale &&
+            strcmp(s_fcache_entries[i].path, path) == 0) return i;
+    }
+    return -1;
+}
+
 static FILE *fcache_open_handle_locked(int entry_idx) {
     fcache_init_handles_locked();
     for (int i = 0; i < FCACHE_MAX_HANDLES; i++) {
         if (s_fcache_handles[i].entry_idx == -1) {
             s_fcache_handles[i].entry_idx = entry_idx;
             s_fcache_handles[i].pos = 0;
+            s_fcache_entries[entry_idx].last_used = ++s_fcache_clock;
             return (FILE *) &s_fcache_handles[i];
         }
     }
     return NULL;
+}
+
+// Evicts entry `idx` and shifts the array down, fixing up every open
+// handle's entry_idx so it keeps pointing at the same logical file --
+// swap-with-last (like fcache_invalidate uses) would silently repoint any
+// handle open on the entry that used to be last, since handles store a
+// plain array index, not a pointer. Must be called with an entry that
+// fcache_entry_is_pinned_locked() found unpinned (caller's job).
+static void fcache_evict_locked(int idx) {
+    free(s_fcache_entries[idx].data);
+    s_fcache_total_bytes -= s_fcache_entries[idx].size;
+    for (int i = idx; i < s_fcache_entry_count - 1; i++) {
+        s_fcache_entries[i] = s_fcache_entries[i + 1];
+    }
+    s_fcache_entry_count--;
+    fcache_init_handles_locked();
+    for (int h = 0; h < FCACHE_MAX_HANDLES; h++) {
+        if (s_fcache_handles[h].entry_idx > idx) {
+            s_fcache_handles[h].entry_idx--;
+        }
+    }
+}
+
+static int fcache_entry_is_pinned_locked(int idx) {
+    fcache_init_handles_locked();
+    for (int h = 0; h < FCACHE_MAX_HANDLES; h++) {
+        if (s_fcache_handles[h].entry_idx == idx) return 1;
+    }
+    return 0;
+}
+
+// 2026-09-18: FCACHE_MAX_TOTAL_BYTES had NO eviction at all -- once the 64MB
+// budget filled (confirmed in logs/log_20260918_011317.txt:
+// "[fcache] cached ... 67108796/67108864 bytes total in 155 files", i.e.
+// 68 bytes of headroom left after the main menu alone), fcache_populate()
+// just silently gave up caching for the REST OF THE SESSION. Every asset
+// requested after that point -- including ones the engine reopens
+// repeatedly across stage transitions -- paid full uncached disk I/O
+// forever, a direct contributor to slow level loads. Evict least-recently-
+// used entries (skipping any with an open FILE* handle, which would dangle
+// it) to make room instead of refusing new entries once full.
+static int fcache_evict_one_lru_locked(void) {
+    int oldest = -1;
+    unsigned oldest_used = 0;
+    for (int i = 0; i < s_fcache_entry_count; i++) {
+        if (fcache_entry_is_pinned_locked(i)) continue;
+        if (oldest < 0 || s_fcache_entries[i].last_used < oldest_used) {
+            oldest = i;
+            oldest_used = s_fcache_entries[i].last_used;
+        }
+    }
+    if (oldest < 0) return 0; // everything left in cache is pinned open
+    l_debug("[fcache] evicting %s (%ld bytes, LRU)",
+            s_fcache_entries[oldest].path, s_fcache_entries[oldest].size);
+    fcache_evict_locked(oldest);
+    return 1;
+}
+
+static int fcache_make_room_locked(long need) {
+    while (s_fcache_total_bytes + need > FCACHE_MAX_TOTAL_BYTES) {
+        if (!fcache_evict_one_lru_locked()) return 0;
+    }
+    return 1;
 }
 
 static inline int fcache_is_cacheable_mode(const char *mode) {
@@ -398,13 +484,25 @@ static inline int fcache_is_cacheable_mode(const char *mode) {
 void fcache_invalidate(const char *path) {
     if (!path) return;
     pthread_mutex_lock(&s_fcache_lock);
-    for (int i = 0; i < s_fcache_entry_count; i++) {
-        if (strcmp(s_fcache_entries[i].path, path) == 0) {
-            free(s_fcache_entries[i].data);
-            s_fcache_total_bytes -= s_fcache_entries[i].size;
-            s_fcache_entries[i] = s_fcache_entries[--s_fcache_entry_count];
+    // 2026-09-18: ANTES esto hacia swap-with-last SIN ajustar los
+    // entry_idx de los handles abiertos -- cualquier handle abierto sobre
+    // la ultima entrada quedaba re-apuntado en silencio a OTRO archivo
+    // (o a memoria liberada), y el engine parseaba basura: cuelgue sin
+    // dump en el peor caso (típicamente con autoguardado en transicion de
+    // stage, que es justo cuando se abre SaveGame.bin en escritura
+    // mientras otros assets siguen abiertos). Ahora: shift+fixup via
+    // fcache_evict_locked (los handles ajenos ni se enteran) y, si la
+    // entrada invalidada TIENE handles abiertos, se marca stale en vez de
+    // liberarse bajo ellos (ver FCacheEntry::stale); fclose la evicta al
+    // cerrarse el ultimo handle.
+    int idx = fcache_find_entry_locked(path);
+    if (idx >= 0) {
+        if (fcache_entry_is_pinned_locked(idx)) {
+            s_fcache_entries[idx].stale = 1;
+            l_debug("[fcache] invalidated %s (pinned open, marked stale)", path);
+        } else {
+            fcache_evict_locked(idx);
             l_debug("[fcache] invalidated %s", path);
-            break;
         }
     }
     for (int i = 0; i < s_neg_cache_count; ) {
@@ -424,9 +522,21 @@ void fcache_invalidate(const char *path) {
 static void fcache_populate(const char *path, FILE *real_file) {
     pthread_mutex_lock(&s_fcache_lock);
     fcache_init_handles_locked();
-    if (s_fcache_entry_count >= FCACHE_MAX_ENTRIES || strlen(path) >= sizeof(s_fcache_entries[0].path)) {
+    if (strlen(path) >= sizeof(s_fcache_entries[0].path)) {
         pthread_mutex_unlock(&s_fcache_lock);
         return;
+    }
+    // 2026-09-18 (segunda vuelta): el cupo de BYTES ya tiene eviction (arriba),
+    // pero el cupo de ENTRADAS (FCACHE_MAX_ENTRIES=512) es un limite aparte --
+    // log_20260918_152457.txt (con la eviction de bytes ya desplegada) llego
+    // exacto a "512 files" y se quedo ahi con margen de bytes de sobra
+    // (65709636/67108864), confirmando que el conteo de entradas es ahora el
+    // cuello de botella real. Misma solucion: evict LRU si esta al tope.
+    if (s_fcache_entry_count >= FCACHE_MAX_ENTRIES) {
+        if (!fcache_evict_one_lru_locked()) {
+            pthread_mutex_unlock(&s_fcache_lock);
+            return;
+        }
     }
     pthread_mutex_unlock(&s_fcache_lock);
 
@@ -443,8 +553,10 @@ static void fcache_populate(const char *path, FILE *real_file) {
 
     pthread_mutex_lock(&s_fcache_lock);
     if (s_fcache_total_bytes + size > FCACHE_MAX_TOTAL_BYTES) {
-        pthread_mutex_unlock(&s_fcache_lock);
-        return;
+        if (!fcache_make_room_locked(size)) {
+            pthread_mutex_unlock(&s_fcache_lock);
+            return;
+        }
     }
     pthread_mutex_unlock(&s_fcache_lock);
 
@@ -464,7 +576,19 @@ static void fcache_populate(const char *path, FILE *real_file) {
     }
 
     pthread_mutex_lock(&s_fcache_lock);
-    if (s_fcache_entry_count >= FCACHE_MAX_ENTRIES || fcache_find_entry_locked(path) >= 0) {
+    // Un duplicado stale sin lectores se evicta para dejar entrar al fresco;
+    // si tiene lectores (o es valido), no se cachea (fail-safe como antes).
+    int dup = fcache_find_entry_locked(path);
+    if (dup >= 0) {
+        if (s_fcache_entries[dup].stale && !fcache_entry_is_pinned_locked(dup)) {
+            fcache_evict_locked(dup);
+        } else {
+            pthread_mutex_unlock(&s_fcache_lock);
+            free(buf);
+            return;
+        }
+    }
+    if (s_fcache_entry_count >= FCACHE_MAX_ENTRIES) {
         pthread_mutex_unlock(&s_fcache_lock);
         free(buf);
         return;
@@ -474,6 +598,8 @@ static void fcache_populate(const char *path, FILE *real_file) {
     e->path[sizeof(e->path) - 1] = '\0';
     e->data = buf;
     e->size = size;
+    e->last_used = ++s_fcache_clock;
+    e->stale = 0;
     s_fcache_total_bytes += size;
     pthread_mutex_unlock(&s_fcache_lock);
 
@@ -577,14 +703,31 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
         pthread_mutex_unlock(&s_fcache_lock);
     }
 
-    // Fast return if already cached in RAM (0ms file load)
+    // Fast return if already cached in RAM (0ms file load). Stale entries
+    // (invalidadas por escritura posterior) no cuentan como hit: van a disco.
     if (fcache_is_cacheable_mode(mode)) {
         pthread_mutex_lock(&s_fcache_lock);
-        int entry_idx = fcache_find_entry_locked(path);
+        int entry_idx = fcache_find_valid_entry_locked(path);
         FILE *cached = (entry_idx >= 0) ? fcache_open_handle_locked(entry_idx) : NULL;
         pthread_mutex_unlock(&s_fcache_lock);
         if (cached) {
-            l_debug("fopen(%s, %s): %p (fcache hit)", path, mode, cached);
+            // 2026-09-19 (usuario): bajon de FPS al pelear con el jefe cuando
+            // cae por una explosion. Cada instancia de explosion/particula
+            // reabre el mismo puñado de archivos (bombexplosion*.bdae,
+            // fireball.kot, glow04.kot, sfx_MC_bomb_explode.kow, ...) varias
+            // veces por segundo -- confirmado en logs/log_20260919_152329.txt
+            // (decenas de "fopen(...bombexplosion...): ... (fcache hit)" en
+            // pocos cientos de lineas durante el combate). El throttle de
+            // logger.c (_log_throttle_sinks) ya existe para esto pero
+            // compara el TEXTO completo de la linea -- el %p del handle
+            // (distinto en cada open) hacia que CADA repeticion pareciera una
+            // linea nueva y pagara su propio sceIoOpen+Write+Close+sendto sin
+            // throttle nunca. Sacar el handle del texto (no aporta nada de
+            // diagnostico sobre un cache hit) deja que las reaperturas del
+            // mismo path+mode sean byte-identicas y el throttle existente las
+            // corte despues de la 3ra, en vez de tener que inventar un
+            // mecanismo nuevo.
+            l_debug("fopen(%s, %s): (fcache hit)", path, mode);
             return cached;
         }
     }
@@ -871,10 +1014,29 @@ int stat_soloader(const char * path, stat64_bionic * buf) {
 
 int fclose_soloader(FILE * f) {
     if (fcache_is_handle(f)) {
+        // Mismo motivo que el fopen de arriba: capturar el path ANTES de
+        // soltar el mutex/evictar, para poder loguear el nombre en vez del
+        // handle (%p, distinto en cada close -- nunca throttleable) y que
+        // las reaperturas/recierres repetidos del mismo archivo (una
+        // explosion/particula spawneando el mismo puñado de assets muchas
+        // veces por segundo) caigan en el throttle de logger.c.
+        char path_copy[256] = "";
         pthread_mutex_lock(&s_fcache_lock);
+        int old_idx = ((FCacheHandle *) f)->entry_idx;
         ((FCacheHandle *) f)->entry_idx = -1;
+        if (old_idx >= 0 && old_idx < s_fcache_entry_count) {
+            snprintf(path_copy, sizeof(path_copy), "%s", s_fcache_entries[old_idx].path);
+        }
+        // Si la entrada quedo stale por una invalidacion mientras estaba
+        // abierta y ya no tiene lectores, evictarla ahora (shift+fixup, los
+        // demas handles ni se enteran) en vez de dejar basura ocupando cupo.
+        if (old_idx >= 0 && old_idx < s_fcache_entry_count &&
+            s_fcache_entries[old_idx].stale &&
+            !fcache_entry_is_pinned_locked(old_idx)) {
+            fcache_evict_locked(old_idx);
+        }
         pthread_mutex_unlock(&s_fcache_lock);
-        l_debug("fclose(%p): fcache handle released", f);
+        l_debug("fclose(%s): fcache handle released", path_copy);
         return 0;
     }
     int i = storm_ring_find(f);

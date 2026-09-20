@@ -66,6 +66,7 @@ static const char s_ProfileCOMMON_emul_FS[] =
     "\n"
     "#if defined(MULTITEXTURED)\n"
     "uniform sampler2D Sampler1;\n"
+    "uniform float envmapIntensity;\n"
     "#endif\n"
     "\n"
     "#if defined(LIGHTMAP)\n"
@@ -87,18 +88,20 @@ static const char s_ProfileCOMMON_emul_FS[] =
     "#if defined(TEXTURED)\n"
     "    vec4 color = texture2D(Sampler0, vTexCoord0);\n"
     "#if defined(MULTITEXTURED)\n"
-    // Guarded like vColor0/DiffuseColor below: la segunda textura de un
-    // material MULTITEXTURED no siempre llega enlazada en este port (ver
-    // "invalid bind symbol: texture1/texture2" + "Unused parameter" en los
-    // Unlit* hermanos, y envmapIntensity sin enlazar en el programa 41
-    // MULTITEXTURED|TEXTURESKINNED de la montura). Muestrear una unidad sin
-    // textura completa devuelve (0,0,0,1) en GLES2, y el `color *= tex1` sin
-    // guarda convertiria TODO el material en negro -- exactamente la montura
-    // "completamente negra" reportada. Solo se multiplica si tex1 trae senal.
-    "    vec4 tex1 = texture2D(Sampler1, vTexCoord0);\n"
-    "    if ((tex1.r + tex1.g + tex1.b) > 0.03) {\n"
-    "        color *= tex1;\n"
-    "    }\n"
+    // 2026-09-18: las 13/13 .bdae que usan #define MULTITEXTURED con este
+    // efecto (MainCharacter/mc, magic_horse*, Beetle, DemonSoldier, Orc* --
+    // verificado por strings en el dataset local) declaran envmapsurface +
+    // envmapIntensity: Sampler1 es ENVMAP (reflexion especular sobre la
+    // armadura/piel), NO un detail map para multiplicar. El `color *= tex1`
+    // anterior oscurecia el difuso con una textura de envmap tipicamente
+    // oscura -> "sectores en negro" en personaje y montura (el resto del
+    // mundo usa TEXTURED/LIGHTMAP y se veia bien). El envmap real es
+    // ADITIVO modulado por envmapIntensity: con intensity en su default GL
+    // (0.0, si el material no lo setea) es no-op y el difuso sale intacto;
+    // con intensity > 0 suma el reflejo como diseno el material. Sin guarda
+    // de senal: una unidad vacia aporta (0,0,0) y no puede ennegrecer nada.
+    "    vec4 env = texture2D(Sampler1, vTexCoord0);\n"
+    "    color.rgb += env.rgb * envmapIntensity;\n"
     "#endif\n"
     "#if defined(LIGHTMAP)\n"
     "    vec4 light = texture2D(Sampler2, vTexCoord1);\n"

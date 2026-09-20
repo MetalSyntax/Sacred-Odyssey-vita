@@ -57,7 +57,10 @@ void glScissor_soloader(GLint x, GLint y, GLsizei width, GLsizei height);
 // two. Rate-limited inside.
 GLint glGetUniformLocation_soloader(GLuint program, const GLchar *name);
 void glUniform4fv_soloader(GLint location, GLsizei count, const GLfloat *value);
+void glUniform4f_soloader(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3);
 void glUniform1i_soloader(GLint location, GLint v0);
+void glUniform1iv_soloader(GLint location, GLsizei count, const GLint *value);
+void glUniform1f_soloader(GLint location, GLfloat v0);
 void glUseProgram_soloader(GLuint program);
 void glTexImage2D_soloader(GLenum target, GLint level, GLint internalformat,
                            GLsizei width, GLsizei height, GLint border,
@@ -68,6 +71,18 @@ void glCompressedTexImage2D_soloader(GLenum target, GLint level, GLenum internal
 void glTexSubImage2D_soloader(GLenum target, GLint level, GLint xoffset, GLint yoffset,
                               GLsizei width, GLsizei height, GLenum format,
                               GLenum type, const GLvoid *pixels);
+
+// Draw-time ground truth for watched programs (see glShaderSource_soloader):
+// passive glUniform observation never fired once for programs 34-40 in
+// a full mission session (the binder may use the 1iv/1f/4f variants, now
+// also wrapped above), so these query the ACTUAL uniform/texture-bind
+// state live at draw time instead. Pure logging + call-through, no state
+// modified beyond the same tiny bound-texture-per-unit tracker glActiveTexture/
+// glBindTexture already need to answer "what's really bound at unit 0".
+void glActiveTexture_soloader(GLenum texture);
+void glBindTexture_soloader(GLenum target, GLuint texture);
+void glDrawArrays_soloader(GLenum mode, GLint first, GLsizei count);
+void glDrawElements_soloader(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices);
 
 #ifdef __cplusplus
 };

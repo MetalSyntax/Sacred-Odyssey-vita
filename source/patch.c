@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
+#include <psp2/kernel/processmgr.h>
 
 extern so_module so_mod;
 
@@ -113,8 +114,42 @@ static void license_load_config_stub(void) {
 // eliminando docenas de llamadas bloqueantes a vglSwapBuffers (cada una espera VBLANK ~16ms),
 // ahorrando cientos de milisegundos de espera ociosa en la carga de partida.
 static void world_load_yield(void) {
+    // sceKernelPowerTick() en CADA llamada (no solo cada 150ms del gl_swap
+    // de abajo): el main loop normal (main.c) lo llama una vez por iteracion,
+    // pero mientras World::LoadMap corre este do/while los ~100+ objetos se
+    // cargan dentro de UNA sola iteracion de ese loop -- sin este tick aqui,
+    // la consola pasa el stage-transition completo (~10-20s en logs reales,
+    // confirmado por [render_diag] cayendo a fps=3.5 en la ventana que
+    // contiene la carga) sin un solo tick de energia, justo la clase de hueco
+    // que el power manager de la Vita puede interpretar como inactividad.
+    sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
+
+    // 2026-09-18: contador de progreso del do/while (este callback corre una
+    // vez por objeto tras retornar GameObjectManager::Load). Si una
+    // transicion de stage se congela de verdad, el log muestra EXACTAMENTE
+    // cuantos objetos completaron + hace cuanto, y cruzado con el ultimo
+    // "Loading game object: X" del engine identifica el objeto que cuelga --
+    // sin esto un freeze es indistinguible de "carga lenta". Heuristica de
+    // corrida nueva: >5s sin llamadas = otro LoadMap (el contador se resetea).
+    // ~4 lineas por transicion; despreciable frente al I/O de la carga.
+    static unsigned loadmap_done = 0;
+    static uint64_t loadmap_start_ms = 0;
+    static uint64_t loadmap_last_ms = 0;
+    uint64_t now_ms = current_timestamp_ms();
+    if (loadmap_start_ms == 0 || now_ms - loadmap_last_ms > 5000) {
+        loadmap_done = 0;
+        loadmap_start_ms = now_ms;
+        l_debug("[loadmap] object loop start");
+    }
+    loadmap_last_ms = now_ms;
+    loadmap_done++;
+    if ((loadmap_done % 25) == 0) {
+        l_debug("[loadmap] %u game objects loaded (%llu ms into this LoadMap)",
+                loadmap_done, (unsigned long long)(now_ms - loadmap_start_ms));
+    }
+
     static uint64_t last_swap_ms = 0;
-    uint64_t now = current_timestamp_ms();
+    uint64_t now = now_ms;
     if (now - last_swap_ms < 150) return;
     last_swap_ms = now;
     gl_swap();
@@ -549,6 +584,84 @@ static void so_patch_v106(void) {
         l_info("Patched v106 World::LoadMap game-object loop yield "
                "(0x2171aa -> b.w 0x3463d4, callback=0x%08x, read-back 0x%08x)",
                cb_addr, *site);
+    }
+
+    // 2026-09-19 (usuario, log_20260919_211800.txt): "todavia tuve bajones"
+    // pese al fix de arriba -- [render_diag] sigue cayendo a fps=1.2-13 en
+    // varios puntos (ej. frame=24300 fps=3.1) que NO coinciden con
+    // "World loading: game objects" sino con "World loading: graphical maps"
+    // (`--------WorldManager::UnloadWorld()` seguido de `--------LoadWorld()
+    // world N!`), justo antes: 600+ lineas de `[fcache] cached`/`evicting`
+    // cargando decenas de texturas de escena (.kot) sin un solo render_diag
+    // de por medio. Causa (misma familia que el fix de arriba, loop DISTINTO
+    // -- confirmada en el .so real via `arm-vita-eabi-objdump -d
+    // --start-address=0x217050`, no solo en el pseudo-C): `World::LoadMap()`
+    // case 0 ("graphical maps") tiene su PROPIO do/while separado del de
+    // "game objects" (case 1, ya cubierto arriba) que llama
+    // `World::Add3DMap()` una vez por cada mapa 3D adicional de la escena
+    // (typ. terreno + varios overlays) SIN ceder el control ni una vez:
+    //   2170b0: ldr r3, [r4, #72]   ; <- sitio parcheado (4 bytes)
+    //   2170b2: mov r0, r4
+    //   2170b4: ldr r2, [r4, #4]
+    //   2170b6: adds r6, #1                   ; i++
+    //   2170b8: ldr r3, [r3, #92]
+    //   2170ba: ldr r1, [r3, r5]
+    //   2170bc: movs r3, #1
+    //   2170be: bl 0x217950                    ; World::Add3DMap(int,int,bool)
+    //   2170c2: adds r3, r4, r5
+    //   2170c4: adds r5, #4
+    //   2170c6: str r0, [r3, #16]
+    //   2170c8: bl 0x1ddf1c                    ; SceneObject::EnableSpecialEffect()
+    //   2170cc: cmp r6, r7
+    //   2170ce: blt.n 0x2170b0                 ; i < count? si, repetir
+    // Fix: mismo patron y misma disciplina que el de arriba (opcodes
+    // verificados ensamblando con arm-vita-eabi-as/-ld -Ttext=<direccion>,
+    // no calculados a mano), reutilizando la MISMA cueva muerta de
+    // ALicenseCheck::LoadConfig -- el trampolin de arriba ocupa
+    // 0x3463d4-0x3463ec (24 bytes); este usa el espacio libre justo despues,
+    // 0x3463ec-0x346404 (la siguiente funcion real, ALicenseCheck::Init,
+    // arranca en 0x346450 -- 76 bytes de sobra incluso despues de este
+    // segundo trampolin). Reemplaza las 4 bytes de `ldr r3,[r4,#72]; mov
+    // r0,r4` (las primeras 2 instrucciones de CADA iteracion, antes de que
+    // r0/r3 se usen como argumento/base mas abajo) por un `b.w` al
+    // trampolin, que replica esas 2 instrucciones, llama a
+    // world_load_yield() (el mismo callback ya usado arriba: gl_swap()
+    // throttleado a 150ms + sceKernelPowerTick todos los frames), y salta de
+    // vuelta a 0x2170b4 -- r4/r5/r6/r7 (this/offset/contador/total) quedan
+    // intactos porque world_load_yield() es una funcion C AAPCS normal (no
+    // toca r4-r11 sin salvarlos ella misma); r0-r3 se salvan/restauran
+    // explicitamente por las dudas (mismo `push/pop {r0-r5, lr}` que el
+    // trampolin de arriba).
+    //     3463ec: ldr r3, [r4, #72]   (replay)
+    //     3463ee: mov r0, r4         (replay)
+    //     3463f0: push {r0-r5, lr}
+    //     3463f2: ldr r3, [pc, #12]   ; -> 346400 (placeholder, parcheado en runtime)
+    //     3463f4: blx r3
+    //     3463f6: pop {r0-r5, lr}
+    //     3463fa: b.w 0x2170b4        ; resume
+    //     346400: .word <direccion de world_load_yield, parcheada en runtime>
+    {
+        static const uint16_t tramp2[] = {
+            0x6ca3, 0x4620, 0xb53f, 0x4b03, 0x4798, 0xe8bd,
+            0x403f, 0xf6d0, 0xbe5b, 0x46c0, 0x0000, 0x0000
+        };
+        static const uint32_t br2 = 0xb99cf12f; // b.w 0x3463ec desde 0x2170b0
+        volatile uint32_t *site2 =
+            (volatile uint32_t *)(so_mod.text_base + 0x2170b0);
+        if (*site2 != 0x46206ca3u) { // ldr r3,[r4,#72]; mov r0,r4
+            l_warn("v106 World::LoadMap graphical-maps loop site mismatch (found 0x%08x, "
+                   "want 0x46206ca3) -- skipping load-yield patch", *site2);
+            return;
+        }
+        kuKernelCpuUnrestrictedMemcpy((void *)(so_mod.text_base + 0x3463ec),
+                                      tramp2, sizeof(tramp2));
+        uint32_t cb_addr2 = (uint32_t)(uintptr_t)&world_load_yield;
+        kuKernelCpuUnrestrictedMemcpy((void *)(so_mod.text_base + 0x3463ec + 0x14),
+                                      &cb_addr2, sizeof(cb_addr2));
+        kuKernelCpuUnrestrictedMemcpy((void *)site2, &br2, sizeof(br2));
+        l_info("Patched v106 World::LoadMap graphical-maps loop yield "
+               "(0x2170b0 -> b.w 0x3463ec, callback=0x%08x, read-back 0x%08x)",
+               cb_addr2, *site2);
     }
 }
 
