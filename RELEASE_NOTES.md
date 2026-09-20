@@ -1,51 +1,52 @@
-# Sacred Odyssey: Rise of Ayden — PS Vita Port — v0.1.0 (primer release)
+# Sacred Odyssey: Rise of Ayden — PS Vita Port — v0.1.0 (first release)
 
-Primera versión jugable del port nativo de **Sacred Odyssey: Rise of Ayden** (Android, Gameloft
-**Glitch** engine) a PS Vita. Corre el `libsacredodyssey.so` original sin modificar, a través de un
-puente SoLoader + FalsoJNI — no se reimplementó lógica del juego, solo la capa Android/JNI/OpenGL ES
-por debajo.
+First playable version of the native port of **Sacred Odyssey: Rise of Ayden** (Android, Gameloft
+**Glitch** engine) to PS Vita. Runs the original `libsacredodyssey.so` unmodified through a
+SoLoader + FalsoJNI bridge — no game logic was reimplemented, only the Android/JNI/OpenGL ES layer
+underneath it.
 
-## Qué incluye este release
+## What's in this release
 
-- El juego arranca, carga partidas guardadas y es jugable de principio a fin con mando físico.
-- **Controles físicos completos:**
-  - Stick izquierdo / D-Pad: movimiento.
-  - Stick derecho: rotación de cámara (funciona sin necesidad de tocar la pantalla).
-  - Cruz, Cuadrado, Triángulo, Círculo, gatillos L/R: mapeados a las acciones contextuales del HUD
-    (ataque, defensa, montar/desmontar caballo, menú de armas, diálogos, cofres, bombas, etc.).
-  - START: pausa/menú de sistema. SELECT: menú en partida / minimapa.
-  - Combo L+R: revela el HUD virtual completo a opacidad total (para inspeccionar o tocar directo
-    cualquier ícono, incluso los que quedan atenuados durante el juego normal).
-- **HUD reorganizado para consola:** los íconos que la pantalla táctil original mostraba todos a la vez
-  (pensados para dedos, no para un mando) se atenúan durante el juego normal, salvo los que siguen
-  siendo información relevante todo el tiempo: minimapa, retrato/vida del personaje, ícono de menú y el
-  ícono de cambio de arma. El resto de los íconos siguen tocables (para quien prefiera jugar con la
-  pantalla), solo más discretos visualmente.
-- **Corrección de texturas negras** en personaje y montura (materiales `MULTITEXTURED`): la segunda
-  textura de esos materiales es un mapa de reflejo (envmap) aditivo, no un detalle multiplicativo como
-  se interpretó en una primera pasada — el shader embebido ya lo trata correctamente.
-- **Fixes de estabilidad:** crash al montar el caballo (puntero de widget colgante), fcache de
-  archivos corrupto al invalidar entradas durante autoguardado/transición de stage, y varios crashes de
-  arranque específicos del build v1.0.6 (ver `port_progress.md` para el detalle completo, bug por bug).
-- **Mejoras de carga:** dos cuellos de botella reales identificados y corregidos en `World::LoadMap()`
-  (el loop de carga de objetos del mundo y el de mapas gráficos/texturas de escena bloqueaban el frame
-  completo hasta terminar, sin ceder control ni un tick de energía) — las transiciones de stage y de
-  mapa del mundo ya no se sienten como un congelamiento total.
+- The game boots, loads saved games, and is fully playable from start to finish with a physical
+  controller.
+- **Full physical control mapping:**
+  - Left stick / D-Pad: movement.
+  - Right stick: camera rotation (works without needing to touch the screen).
+  - Cross, Square, Triangle, Circle, L/R triggers: mapped to the HUD's contextual actions (attack,
+    defense, mount/dismount horse, weapon-switch menu, dialogs, treasure chests, bombs, etc.).
+  - START: pause / system menu. SELECT: in-game menu / minimap.
+  - L+R combo: reveals the full virtual HUD at full opacity (to inspect or directly touch any icon,
+    including the ones that stay dimmed during normal gameplay).
+- **HUD reorganized for console play:** the icons the original touchscreen UI showed all at once
+  (designed for fingers, not a controller) are dimmed during normal gameplay, except for the ones that
+  remain relevant information at all times: minimap, character portrait/health, menu icon, and the
+  weapon-switch icon. The rest of the icons stay touchable (for anyone who prefers playing via the
+  touchscreen), just visually more subtle.
+- **Black-texture fix** on the character and mount (`MULTITEXTURED` materials): the second texture on
+  those materials is an additive reflection (envmap) map, not a multiplicative detail layer as an
+  earlier pass had assumed — the embedded shader now handles it correctly.
+- **Stability fixes:** a crash when mounting the horse (dangling widget pointer), a corrupted file
+  cache when invalidating entries during autosave/stage transitions, and several boot-time crashes
+  specific to the v1.0.6 build (see `port_progress.md` for the full bug-by-bug detail).
+- **Loading improvements:** two real bottlenecks identified and fixed inside `World::LoadMap()` (the
+  world game-object loading loop and the scene/graphical-maps loading loop both blocked the entire
+  frame until they finished, without yielding control or a single power tick) — stage transitions and
+  world-map transitions no longer feel like a total freeze.
 
-## Problemas conocidos
+## Known issues
 
-- **FPS erráticos:** el framerate fluctúa de forma perceptible durante el juego normal (picos y caídas
-  dentro de una misma escena, sin llegar a los congelamientos severos ya corregidos en las transiciones
-  de carga). Es el único problema abierto reportado hasta este release. Seguirá siendo investigado con
-  telemetría dirigida en próximas versiones.
-- Ver [`port_progress.md`](port_progress.md) para el historial completo de bugs confirmados y su causa
-  raíz real (no especulada) — la política de este port es un bug a la vez, con evidencia de consola
-  física antes de darlo por cerrado.
+- **Erratic FPS:** framerate fluctuates noticeably during normal gameplay (spikes and dips within the
+  same scene, short of the severe freezes already fixed during loading transitions). This is the only
+  open issue reported as of this release. It will keep being investigated with targeted telemetry in
+  upcoming versions.
+- See [`port_progress.md`](port_progress.md) for the full history of confirmed bugs and their real
+  (not speculative) root cause — this port's policy is one bug at a time, with real-hardware evidence
+  before calling it closed.
 
-## Instalación
+## Installation
 
-1. Instalar el `.vpk` generado (`build/sacredodyssey.vpk`) con VitaShell.
-2. Desde la instalación Android original, copiar a `ux0:data/sacredodyssey/` en la Vita:
+1. Install the generated `.vpk` (`build/sacredodyssey.vpk`) with VitaShell.
+2. From the original Android install, copy the following to `ux0:data/sacredodyssey/` on the Vita:
    ```text
    ux0:data/sacredodyssey/
    ├── libsacredodyssey.so
@@ -53,23 +54,23 @@ por debajo.
    └── GloftSOHP/
        └── data/       (3d, 2d, audio, menus, automat, ...)
    ```
-3. Requiere `kubridge.skprx` y `libshacccg.suprx` instalados (ver [`README.md`](README.md) para el
-   detalle de requisitos).
-4. Lanzar el juego — la primera ejecución crea sus propios saves/logs bajo
-   `ux0:data/sacredodyssey/saves/` y `ux0:data/sacredodyssey/logs/`.
+3. Requires `kubridge.skprx` and `libshacccg.suprx` installed (see [`README.md`](README.md) for the
+   full requirements).
+4. Launch the game — the first run creates its own saves/logs under
+   `ux0:data/sacredodyssey/saves/` and `ux0:data/sacredodyssey/logs/`.
 
-Este repositorio **no** distribuye el APK, el `.so` ni los assets del juego (ver `.gitignore`) — hace
-falta una copia legítima propia de Sacred Odyssey: Rise of Ayden.
+This repository does **not** distribute the APK, the `.so`, or the game's assets (see `.gitignore`) —
+you need your own legitimate copy of Sacred Odyssey: Rise of Ayden.
 
-## Créditos
+## Credits
 
-- **Sacred Odyssey: Rise of Ayden** y su motor (Gameloft Glitch) son propiedad de **Gameloft** — este
-  repositorio no reclama autoría sobre el juego original.
-- **Andy "TheFloW" Nguyen** por el concepto original del loader Android `.so`.
-- **Rinnegatamante** por [vitaGL](https://github.com/Rinnegatamante/vitaGL).
-- **Volodymyr Atamanenko** por el boilerplate del soloader y FalsoJNI.
+- **Sacred Odyssey: Rise of Ayden** and its engine (Gameloft Glitch) are property of **Gameloft** —
+  this repository makes no claim of authorship over the original game.
+- **Andy "TheFloW" Nguyen** for the original Android `.so` loader concept.
+- **Rinnegatamante** for [vitaGL](https://github.com/Rinnegatamante/vitaGL).
+- **Volodymyr Atamanenko** for the soloader boilerplate and FalsoJNI.
 
-## Licencia
+## License
 
-El código de este port es MIT (ver [`LICENSE`](LICENSE)). El juego y sus assets siguen siendo propiedad
-de Gameloft y no se distribuyen en este repositorio.
+This port's code is MIT-licensed (see [`LICENSE`](LICENSE)). The game and its assets remain the
+property of Gameloft and are not distributed in this repository.
