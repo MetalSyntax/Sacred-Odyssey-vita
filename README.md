@@ -7,7 +7,7 @@
 <p align="center">
   <img alt="platform" src="https://img.shields.io/badge/platform-PS%20Vita%20%7C%20PSTV-informational">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-blue">
-  <img alt="status" src="https://img.shields.io/badge/status-in%20development-yellow">
+  <img alt="status" src="https://img.shields.io/badge/status-playable-green">
 </p>
 
 Native port of **Sacred Odyssey: Rise of Ayden** (Android, `com.gameloft.android.ANMP.GloftSOHP.ML`,
@@ -17,18 +17,41 @@ the Android/JNI/OpenGL ES layer underneath it.
 
 ## Status
 
-- 🔧 **In active development.** The game boots, loads saves, and is playable, but the following are
-  still being tracked down one confirmed bug at a time (see [`port_progress.md`](port_progress.md)):
-  - Physical button + dual-analog-stick mapping to the in-game HUD widgets (movement, camera, attack,
-    defense, horse mount/dismount, menus) is implemented and working.
-  - A crash while mounted on the horse (dangling `HudWidget*` in the HUD widget table) was root-caused
-    from a real console crash dump and fixed.
-  - Multi-textured surfaces (partially black character/object textures) were traced to a shader uniform
-    naming mismatch (`texture2`) against the engine's own material binder and fixed.
-  - FPS drops in scenes with several skinned/animated meshes at once are a known, documented trade-off:
-    the hardware-skinning uniform arrays were removed on purpose after they caused a harder crash
-    (per-mesh bone-count mismatch), so those meshes render in bind pose with a bind-symbol log warning
-    instead of crashing — a real fix requires generating the shader per material's bone count.
+- ✅ **Playable (v0.1.0, first release — see [`RELEASE_NOTES.md`](RELEASE_NOTES.md)).** The game boots,
+  loads saves, and is fully playable from start to finish with a physical controller, although it is
+  still in development and has one known open issue (erratic FPS, see below).
+- 🎮 **Full physical control mapping** (`source/controls.c`): left stick / D-Pad for 360° movement
+  (radial deadzone), right stick for camera rotation (works without touching the screen, via a
+  `CameraRotatePad::UpdateTouchInfo` gate hook), and every face button / trigger mapped to its HUD
+  widget — attack, shield, horse mount/dismount, minimap, pause and in-game menus. Touch screen keeps
+  working in parallel (5 shared slots). Pressing **L+R together** reveals the full virtual HUD at
+  full opacity.
+- 🖥️ **HUD reorganized for console play:** menu icon, character portrait/health, minimap and the
+  weapon-switch icon stay at full opacity at all times; the rest of the touchscreen HUD is dimmed to
+  the background (still touchable) instead of covering the screen.
+- 🔊 **Real audio:** the engine's native VOX middleware is bridged from `android/media/AudioTrack`
+  to `sceAudioOut` (44.1 kHz stereo 16-bit, dedicated output thread) — the game is no longer mute.
+- 🎨 **Graphics fixes:** the black patches on the character/mount were traced to the second texture
+  of `MULTITEXTURED` materials being an *additive reflection (envmap)* map, not a multiplicative
+  detail layer as first assumed — the embedded shader now adds it scaled by `envmapIntensity`
+  instead of multiplying. Missing effect shaders (`Unlit*`, `ProfileCOMMON_emul_*`) are provided
+  from reconstructed sources embedded in the eboot, so they work without reinstalling the `.vpk`.
+- ⚡ **Loading improvements:** two real stalls inside `World::LoadMap()` (the game-object loop and
+  the graphical-maps loop both blocked the frame without yielding) now yield periodically, plus a
+  64 MB RAM file cache with LRU eviction, kernel I/O cache tuning and a persistent vitaGL shader
+  cache — stage transitions no longer feel like a total freeze.
+- 🩹 **Stability fixes:** crashes when mounting the horse (dangling `HudWidget*`, now guarded by
+  alignment + plausibility checks), a Triangle-button crash from a stale widget-table entry, a file
+  cache corruption during autosave/stage transitions, a cutscene fade-material crash, plus the
+  boot-time `Gameplay::s_instance` / `FileManager` / license-check crashes from the initial bring-up.
+  Every one was root-caused from a real console crash dump — see [`port_progress.md`](port_progress.md).
+- ⚠️ **Known issue:** erratic FPS — framerate fluctuates during normal gameplay (worse in
+  boss-fight combat with heavy particles). The two hard load stalls are fixed; the remaining
+  fluctuation is still under investigation with targeted telemetry.
+- 🔬 **Known trade-off:** skinned/animated meshes render in bind pose — the hardware-skinning
+  uniform arrays were removed on purpose after they caused a harder crash (per-mesh bone-count
+  mismatch), so those meshes log a bind-symbol warning instead of crashing. A real fix requires
+  generating the shader per material's bone count.
 - 📋 Full engine findings and porting plan in [`PORTING_PLAN.md`](PORTING_PLAN.md).
 
 ## Requirements
@@ -59,21 +82,22 @@ the Android/JNI/OpenGL ES layer underneath it.
 
 | Vita | In-game action |
 |---|---|
-| Left stick / D-Pad | Movement (360°, with an added radial deadzone) |
-| Right stick | Camera rotation |
-| ✕ (Cross) | Contextual action: advance tutorial dialog, skip cutscene, talk to NPC, open treasure, pick up bomb, push box, rotate mirror, or default action |
-| □ (Square) | Melee attack / sword |
-| △ (Triangle) | Secondary weapons / items / weapon-switch menu |
-| ○ (Circle) | Defense / shield in gameplay; Back in menus/dialogs |
+| Left stick / D-Pad | Movement (360°, radial deadzone) |
+| Right stick | Camera rotation (works without touching the screen) |
+| ✕ (Cross) | Sword / melee attack |
+| ○ (Circle) | Defense / shield (never opens menus) |
+| △ (Triangle) | Mount / dismount horse |
+| □ (Square) | Minimap |
 | L Trigger | Defense / shield, or target lock |
-| R Trigger | Mount / dismount horse, or secondary attack |
+| R Trigger | Mount / dismount horse |
+| L + R together | Reveal the full virtual HUD at full opacity (press again to dim it back) |
 | START | Pause / system menu |
-| SELECT | In-game menu / inventory / minimap |
-| Front touch screen | Full native multitouch, shared with the physical-button mappings above (5 tracked slots) |
+| SELECT | In-game menu / weapon switch |
+| Front touch screen | Full native multitouch, works in parallel with the physical buttons above (5 shared slots) |
 
-Physical buttons are dynamically mapped to whichever on-screen HUD widget is actually active/visible at
-that moment (read from the game's own HUD widget table at runtime, see `source/controls.c`), falling
-back to a fixed screen position if the corresponding widget isn't currently on screen.
+Menu icon, character portrait/health, minimap and the weapon-switch icon are always shown at full
+opacity; the rest of the touchscreen HUD is dimmed to the background (still fully touchable — dimming
+only changes alpha, never the visible/active flags the touch hit-test needs; see `source/controls.c`).
 
 ## Building from source
 
@@ -97,14 +121,21 @@ psvita-toolkit deploy --vpk
 
 ## Repository layout
 
-- `source/`, `lib/so_util`, `lib/falso_jni` — the loader (SoLoader + FalsoJNI) and its compatibility
-  patches (`patch.c`, `java.c`, `dynlib.c`), plus the physical control mapping (`controls.c`).
-- `lib/vitagl` — vendored [vitaGL](https://github.com/Rinnegatamante/vitaGL) submodule.
-- `extras/shaders/` — reconstructed GLSL shader sources used by the engine's material system, embedded
-  into the eboot at build time (`source/utils/embedded_shaders.c`) so they don't depend on reinstalling
-  the full `.vpk`.
+- `source/` — the loader: `main.c` (lifecycle + render loop), `controls.c` (physical input mapping
+  + HUD management), `audio.c` (AudioTrack → `sceAudioOut` bridge), `patch.c` (binary compatibility
+  patches against the original `.so`), `java.c` (FalsoJNI method table), `dynlib.c` (symbol
+  resolution), `reimpl/io.c` (file I/O + shader/texture asset redirects + RAM cache),
+  `utils/glutil.c` (vitaGL wrappers, embedded-shader substitution, texture-unit guards),
+  `utils/embedded_shaders.c` (reconstructed GLSL sources embedded in the eboot).
+- `lib/so_util`, `lib/falso_jni` — SoLoader + FalsoJNI framework.
+- `lib/fios` — FIOS2 kernel I/O cache (tuned up for this port's asset streaming).
+- `lib/vitagl` — vendored [vitaGL](https://github.com/Rinnegatamante/vitaGL) submodule, built from
+  source (`SOFTFP_ABI=1 NO_SPLASHSCREEN=1 HAVE_SHADER_CACHE=1` + perf flags, see `CMakeLists.txt`).
+- `extras/shaders/` — reconstructed GLSL shader sources, mirrored by the embedded copies in
+  `source/utils/embedded_shaders.c` so they install themselves on first run.
 - `decompiled/` — decompiled Java (jadx) and pseudo-C (Ghidra) of the original `.so`, used for crash
   triage (gitignored, regenerable).
+- `RELEASE_NOTES.md` — what each release contains and its known issues.
 - `PORTING_PLAN.md` — living porting plan, updated as real engine details get confirmed.
 - `port_progress.md` — bug log, one confirmed bug at a time, each with its real root cause and fix.
 - `.psvita-toolkit.json` — configuration for `psvita-port-toolkit`, the standalone tool that manages

@@ -188,7 +188,14 @@ static bool get_widget_pos(enum HudWidgetOffset offset, float *out_x, float *out
 // iconos atenuados casi invisibles; subido a ~16% para que sigan de fondo
 // (los controles fisicos los duplican) pero se puedan distinguir a simple
 // vista en vez de parecer apagados del todo.
-#define DIM_ALPHA 40 // ~16% opacity (0-255 scale, confirmed via ASprite::SetAlpha/AnimObject::SetAlpha call sites using 0/0xff as the full range)
+// 2026-09-20 (usuario, log_20260920_142756.txt): "la opacidad no esta al 1%"
+// -- la sesion anterior interpreto mal el pedido como "+1 punto porcentual"
+// (40 -> 43, ~16% -> ~17%). El pedido real es que el valor EN REPOSO sea
+// ~1% (casi invisible), y el L+R de mas abajo la lleve a 100% como
+// alternativa. 3/255 = ~1.2%, el entero mas cercano a 1% sin ser 0 (0
+// dejaria el sprite totalmente invisible; mantenemos un resto minimo
+// perceptible/depurable en pantalla).
+#define DIM_ALPHA 3 // ~1% opacity (0-255 scale, confirmed via ASprite::SetAlpha/AnimObject::SetAlpha call sites using 0/0xff as the full range)
 static int8_t s_dim_logged[128] = {0}; // 0=not yet logged, 1=logged-resolved, 2=logged-unresolved
 static void dim_widget(enum HudWidgetOffset offset, int alpha) {
     bool resolved = false;
@@ -258,9 +265,29 @@ static uintptr_t force_widget_shown(enum HudWidgetOffset offset) {
 // (base + knob hijo en +0x160), pero acá se resuelve por NOMBRE vía
 // HudWidget::FindWidgetByName en vez de adivinar un offset de hijo a mano
 // -- la lección de la "espada" (offset equivocado) de la sesión anterior.
+// 2026-09-20 (usuario, log_20260920_142756.txt): "el icono del personaje
+// sigue con la opacidad baja" -- persiste pese a force_named_child_shown().
+// El log confirmado (dim_widget) muestra que HEALTH_GROUP (offset 96) nunca
+// resuelve un AnimObject propio -- esperable, es un widget GRUPO sin sprite
+// propio -- pero eso NO dice nada sobre si el HIJO "health_bg" se encuentra
+// y se fuerza. No había ningún log en esta función; sin eso, cualquier
+// arreglo siguiente vuelve a ser adivinar (misma trampa que la "espada" de
+// offset equivocado). Se agrega logging una sola vez por nombre, igual
+// patron que s_dim_logged, para que el próximo log real confirme si
+// FindWidgetByName encuentra "health_bg"/"health" o no -- de eso depende el
+// siguiente paso (nombre incorrecto vs. otra causa).
+static int8_t s_named_child_logged[4] = {0};
 static void force_named_child_shown(uintptr_t parent_widget, const char *name) {
     if (!parent_widget || !is_plausible_ptr(parent_widget) || !s_hudwidget_find_widget_by_name) return;
     uintptr_t child = s_hudwidget_find_widget_by_name(parent_widget, name);
+
+    int idx = (strcmp(name, "health_bg") == 0) ? 0 : 1;
+    if (idx >= 0 && idx < (int)(sizeof(s_named_child_logged) / sizeof(s_named_child_logged[0])) && s_named_child_logged[idx] == 0) {
+        s_named_child_logged[idx] = 1;
+        bool resolved = child && is_plausible_ptr(child);
+        l_info("[controls] force_named_child_shown(name=%s): %s", name, resolved ? "found, visible+active+alpha forced" : "NOT FOUND -- FindWidgetByName returned nothing");
+    }
+
     if (!child || !is_plausible_ptr(child)) return;
     *(uint8_t *)(child + 0x18) = 1; // visible
     *(uint8_t *)(child + 0x19) = 1; // active
