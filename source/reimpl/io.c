@@ -857,6 +857,7 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
                     DATA_PATH "GloftSOHP/data/2d/sprites/High_Quality/gameloft_2x.kot";
                 l_warn("Missing splash logo %s -- redirecting to %s", path, logo_path);
                 ret = fopen_soloader(logo_path, mode);
+                return ret;
             } else if (strcmp(base, "KnightsOdyssey_hand2_diffuse.tga") == 0) {
                 // La mano del personaje en mc.bdae referencia
                 // "KnightsOdyssey_hand2_diffuse.tga" (el motor la pide como
@@ -873,6 +874,7 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
                     DATA_PATH "GloftSOHP/data/3d/objects/MainCharacter/KnightsOdyssey_hand_diffuse.kot";
                 l_warn("Missing hand texture %s -- redirecting to %s", path, hand_path);
                 ret = fopen_soloader(hand_path, mode);
+                return ret;
             } else if (strstr(path, "data/3d/effects/") != NULL && strstr(base, ".glsl") != NULL) {
                 // Servir el shader embebido en el eboot (misma tabla que
                 // ensure_embedded_shaders_installed() instala al arranque).
@@ -891,6 +893,7 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
                         l_info("Installed on-demand embedded shader %s (%u bytes)",
                                path, (unsigned)emb_len);
                         ret = fopen_soloader(path, mode);
+                        return ret;
                     }
                 }
                 // Ultimo recurso: shaders empaquetados en el .vpk (requiere
@@ -901,6 +904,7 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
                     ret = fopen_soloader(app0_shader, mode);
                     if (ret) {
                         l_info("Redirected missing shader %s -> %s", path, app0_shader);
+                        return ret;
                     }
                 }
             }
@@ -922,7 +926,7 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
     }
 
     if (ret) {
-        if (mode && !strpbrk(mode, "wa+")) {
+        if (!fcache_is_handle(ret) && mode && !strpbrk(mode, "wa+")) {
 #ifdef USE_SCELIBC_IO
             sceLibcBridge_setvbuf(ret, NULL, _IOFBF, 64 * 1024);
 #else

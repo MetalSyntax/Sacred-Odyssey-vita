@@ -4150,3 +4150,25 @@ Tres pedidos del usuario en un pase, un fix cada uno (compilación limpia desde 
   - Agregado `force_widget_shown(HUD_OFFSET_IGM);` al bloque de widgets permanentes a opacidad completa (visible=1, active=1, alpha=255), junto a `status_healthGroup`, `button_toSysIGM`, `Mini_Map` y `button_switchWeapon`.
 - **Validación:** build con `psvita-toolkit build --preset debug`. Binarios regenerados y listos para consola.
 
+## Sesión 2026-09-29 — Triage de Crash en World 10 (`log_20260925_211329.txt` + `psp2core-1790393754`): Data Abort en SceLibc al redirigir textura faltante ya en fcache
+
+- **Reporte del usuario:** crash al cargar partida/iniciar juego (`psp2core-1790393754-0x0000222ffd-eboot.bin.psp2dmp` + `log_20260925_211329.txt`).
+- **Análisis con `psvita-toolkit analyze`:**
+  - Hilo: `PSVSOTROA` (ID `0x40010003`).
+  - Causa: `0x30004 (Data abort exception)`.
+  - `PC`: `0x8178fd74` en `SceLibc seg1 + 0xfd74`.
+  - `LR`: `0x817901cd` en `SceLibc seg1 + 0x101cd`.
+  - Pila: `0x8100707d` (`fopen_soloader` en `source/reimpl/io.c:931`), llamado desde `glitch::io::CFileSystem::open` en `.so` (`0x982663ef`).
+- **Causa raíz:**
+  - El usuario carga **World 10** (`LoadWorld() world 10!`, cinemática de introducción a caballo con `MCInCutScene_6520` y `mc_animation_cutscenes.bdae`). En pruebas previas del desarrollador solo se cargaban mundos avanzados (World 11/12) que no usan este modelo.
+  - `mc_animation_cutscenes.bdae` referencia la textura inexistente `KnightsOdyssey_hand2_diffuse.tga`.
+  - El loader activa la regla de redirección a `KnightsOdyssey_hand_diffuse.kot`.
+  - Sin embargo, `KnightsOdyssey_hand_diffuse.kot` ya había sido cargada y cacheada en RAM por `fcache` líneas antes (línea 6624). La apertura recursiva resultó en un `(fcache hit)` devolviendo un handle virtual `FCacheHandle*` (`(FILE *)&s_fcache_handles[i]`).
+  - Al faltar un `return ret;` en el bloque de redirección, la función caía a `sceLibcBridge_setvbuf` y `fcache_populate(path, ret)` (línea 931), que llama a `sceLibcBridge_fseek(ret, 0, SEEK_END)`.
+  - `SceLibc` desreferencia el handle virtual como si fuera un `FILE*` nativo de Sony, causando el crash por `Data abort`.
+- **Fix aplicado (`source/reimpl/io.c`):**
+  - Retorno directo (`return ret;`) en todas las redirecciones de `fopen_soloader` (`KnightsOdyssey_hand2_diffuse.tga`, `gameloft_3x_tga`, y shaders).
+  - Guarda estricta `!fcache_is_handle(ret)` antes del bloque `sceLibcBridge_setvbuf` y `fcache_populate`.
+- **Validación:** build limpio con `psvita-toolkit build --preset release`. `sacredodyssey.vpk` y `eboot.bin` regenerados en `build/`.
+
+

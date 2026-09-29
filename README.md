@@ -17,7 +17,7 @@ the Android/JNI/OpenGL ES layer underneath it.
 
 ## Status
 
-- ✅ **Playable (v0.1.0, first release — see [`RELEASE_NOTES.md`](RELEASE_NOTES.md)).** The game boots,
+- ✅ **Playable (v1.0.2, see [`RELEASE_NOTES.md`](RELEASE_NOTES.md)).** The game boots,
   loads saves, and is fully playable from start to finish with a physical controller, although it is
   still in development and has one known open issue (erratic FPS, see below).
 - 🎮 **Full physical control mapping** (`source/controls.c`): left stick / D-Pad for 360° movement
@@ -40,11 +40,12 @@ the Android/JNI/OpenGL ES layer underneath it.
   the graphical-maps loop both blocked the frame without yielding) now yield periodically, plus a
   64 MB RAM file cache with LRU eviction, kernel I/O cache tuning and a persistent vitaGL shader
   cache — stage transitions no longer feel like a total freeze.
-- 🩹 **Stability fixes:** crashes when mounting the horse (dangling `HudWidget*`, now guarded by
-  alignment + plausibility checks), a Triangle-button crash from a stale widget-table entry, a file
-  cache corruption during autosave/stage transitions, a cutscene fade-material crash, plus the
-  boot-time `Gameplay::s_instance` / `FileManager` / license-check crashes from the initial bring-up.
-  Every one was root-caused from a real console crash dump — see [`port_progress.md`](port_progress.md).
+- 🩹 **Stability fixes:** a crash in World 10 cutscenes when redirecting missing textures already in RAM cache,
+  crashes when mounting the horse (dangling `HudWidget*`, now guarded by alignment + plausibility checks),
+  a Triangle-button crash from a stale widget-table entry, a file cache corruption during autosave/stage
+  transitions, a cutscene fade-material crash, plus the boot-time `Gameplay::s_instance` / `FileManager` /
+  license-check crashes from the initial bring-up. Every one was root-caused from a real console crash dump —
+  see [`port_progress.md`](port_progress.md).
 - ⚠️ **Known issue:** erratic FPS — framerate fluctuates during normal gameplay (worse in
   boss-fight combat with heavy particles). The two hard load stalls are fixed; the remaining
   fluctuation is still under investigation with targeted telemetry.

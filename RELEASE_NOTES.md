@@ -1,4 +1,15 @@
-# Sacred Odyssey: Rise of Ayden — PS Vita Port — v0.1.0 (first release)
+# Sacred Odyssey: Rise of Ayden — PS Vita Port — Release Notes
+
+## v1.0.2 Hotfix (2026-09-29)
+
+- **Fix crash in World 10 / introductory cutscenes:**
+  - Fixed a critical `Data abort exception (0x30004)` occurring during the introductory horse cutscene (`HorseWhite_5017`, `MCInCutScene_6520`) when loading World 10 (`mc_animation_cutscenes.bdae`).
+  - The crash was caused by the loader's missing texture redirect (`KnightsOdyssey_hand2_diffuse.tga` -> `KnightsOdyssey_hand_diffuse.kot`) returning an already-cached `fcache` in-memory handle (`FCacheHandle*`) without an early return, causing the outer `fopen` logic to pass the fake handle to `SceLibc` (`sceLibcBridge_setvbuf` / `fcache_populate` -> `sceLibcBridge_fseek`).
+  - Added immediate returns (`return ret;`) to all asset redirects in `fopen_soloader` and guarded the buffer setup against `fcache` handles (`!fcache_is_handle(ret)`).
+
+---
+
+## v0.1.0 / v1.0.1 (Initial Release)
 
 First playable version of the native port of **Sacred Odyssey: Rise of Ayden** (Android, Gameloft
 **Glitch** engine) to PS Vita. Runs the original `libsacredodyssey.so` unmodified through a
