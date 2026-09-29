@@ -1,11 +1,16 @@
 # Sacred Odyssey: Rise of Ayden — PS Vita Port — Release Notes
 
-## v1.0.2 Hotfix (2026-09-29)
+## v1.0.2 (2026-09-29)
 
 - **Fix crash in World 10 / introductory cutscenes:**
   - Fixed a critical `Data abort exception (0x30004)` occurring during the introductory horse cutscene (`HorseWhite_5017`, `MCInCutScene_6520`) when loading World 10 (`mc_animation_cutscenes.bdae`).
   - The crash was caused by the loader's missing texture redirect (`KnightsOdyssey_hand2_diffuse.tga` -> `KnightsOdyssey_hand_diffuse.kot`) returning an already-cached `fcache` in-memory handle (`FCacheHandle*`) without an early return, causing the outer `fopen` logic to pass the fake handle to `SceLibc` (`sceLibcBridge_setvbuf` / `fcache_populate` -> `sceLibcBridge_fseek`).
   - Added immediate returns (`return ret;`) to all asset redirects in `fopen_soloader` and guarded the buffer setup against `fcache` handles (`!fcache_is_handle(ret)`).
+- **Reworked Right Analog Stick Camera (NOVA 2 / Shadow Guardian style):**
+  - **Eliminated sudden camera snaps/resets:** previously, the camera coordinates were only reset in the axis hook when deflected. When the player released the stick, the hook was never called, leaving the accumulator frozen at 500.0f; on the next movement, the engine rotated `lastCamDir` by an instant 333° snap. Accumulation and centering reset now run unconditionally in `controls_update()` every frame.
+  - **Fluid 360° rotation without freezing:** horizontal rotation now wraps smoothly at 4π (1080.0f units, matching the quaternion `fromAngleAxis` period), allowing continuous 360-degree rotation forever.
+  - **Quadratic analog deadzone curve:** implemented standard `0.15f` deadzone with quadratic response (`0.35f * t + 0.65f * t^2`) for precision aiming and smooth full-stick pans.
+  - **Customizable sensitivity:** loads optional sensitivity setting from `ux0:data/sacredodyssey/camera_sens.txt` (1..10, default 5).
 
 ---
 

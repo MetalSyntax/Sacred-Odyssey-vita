@@ -84,7 +84,7 @@ the Android/JNI/OpenGL ES layer underneath it.
 | Vita | In-game action |
 |---|---|
 | Left stick / D-Pad | Movement (360°, radial deadzone) |
-| Right stick | Camera rotation (works without touching the screen) |
+| Right stick | Smooth analog camera rotation (calibrated quadratic curve, 360° continuous rotation) |
 | ✕ (Cross) | Sword / melee attack |
 | ○ (Circle) | Defense / shield (never opens menus) |
 | △ (Triangle) | Mount / dismount horse |

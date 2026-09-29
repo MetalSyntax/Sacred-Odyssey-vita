@@ -4170,5 +4170,29 @@ Tres pedidos del usuario en un pase, un fix cada uno (compilación limpia desde 
   - Retorno directo (`return ret;`) en todas las redirecciones de `fopen_soloader` (`KnightsOdyssey_hand2_diffuse.tga`, `gameloft_3x_tga`, y shaders).
   - Guarda estricta `!fcache_is_handle(ret)` antes del bloque `sceLibcBridge_setvbuf` y `fcache_populate`.
 - **Validación:** build limpio con `psvita-toolkit build --preset release`. `sacredodyssey.vpk` y `eboot.bin` regenerados en `build/`.
+- **Verificación en hardware:** el usuario confirmó en nueva partida (`log_20260920_174634.txt`) que el crash de cinemática quedó 100% resuelto.
+
+## Sesión 2026-09-29 (parte 2) — Calibración de Cámara (Stick Derecho): Eliminación de salto brusco (snap) y congelamiento mediante modelo cuadrático estilo NOVA 2 / Shadow Guardian
+
+- **Reporte del usuario:** "al mover el joystick derecho he notado que la camara se reinicia o se mueve de posicion muy brusco o drastico y no corresponde desde el punto donde se esta moviendo ni al movimiento, revisa como se usa la camara en NOVA 2 y Shadow Guardian para afinarla".
+- **Causa raíz técnica (confirmada en desensamblado `0x214f30`–`0x215080` de `libsacredodyssey.so` y Ghidra `CameraManager::Update`):**
+  1. **El salto brusco (snap de 333°):**
+     - En `CameraManager::Update`, cuando el widget de cámara está en reposo (`*(char*)(widget + 0x1a) == 0`), el motor guarda la orientación actual en `lastCamDir` y la altura en `lastHeight`.
+     - Cuando el widget está activo (`+0x1a != 0`), llama a `CameraRotatePad::Get_MovePad_AxisValues(&out)`, calcula `angle = (out[0] / 270.0f) * PI` (540 unidades = 360°) y rota `lastCamDir` aplicando `glitch::core::quaternion::fromAngleAxis`.
+     - En la implementación previa de `source/controls.c`, el reseteo de `s_vcam_cur_x` y `s_vcam_cur_y` estaba en el bloque `else` de `hook_CameraRotatePad_Get_MovePad_AxisValues`.
+     - Sin embargo, dicha función **SOLO se ejecuta cuando el stick está deflectado** (`+0x1a != 0`). Al soltar el stick, `+0x1a` volvía a 0 y `Get_MovePad_AxisValues` **nunca se llamaba en reposo**, dejando `s_vcam_cur_x` congelado en `±500.0f`.
+     - Mientras tanto, el motor actualizaba `lastCamDir` a la vista actual. Al mover el stick de nuevo, `out[0]` arrancaba inmediatamente en `500.0f` en el frame 1, provocando un salto angular instantáneo de `(500/270)*PI = 333°`.
+  2. **El congelamiento:**
+     - El clamp rígido a `[-500.0f, 500.0f]` impedía rotar 360° continuamente (se frenaba al cabo de unos pocos frames de sostener el stick).
+  3. **Respuesta no analógica:**
+     - Velocidad lineal fija (12.0f/frame) sin zona muerta ni aceleración progresiva.
+- **Solución implementada (`source/controls.c`):**
+  - **Curva cuadrática unificada estilo NOVA 2 / Shadow Guardian:** zona muerta de `0.15f` con respuesta cuadrática `t = 0.35f * t + 0.65f * t * t` para control fino al apuntar y giro suave a máxima deflexión.
+  - **Integración y reseteo por frame en `controls_update()`:** el reseteo de `s_vcam_cur_x/y` a 0 se ejecuta incondicionalmente cada frame en reposo, garantizando que todo nuevo movimiento comience fluidamente desde 0 sin saltos angulares.
+  - **Wrap horizontal continuo en 4π (1080.0f):** el cuaternión en `fromAngleAxis` tiene período 4π. Envolver `s_vcam_cur_x` en `±1080.0f` permite rotación 360° infinita y continua con cero discontinuidad.
+  - **Velocidades calibradas:** `CAM_SPEED_X = 4.5f` (giro 360° en 2.0s a 60 FPS) y `CAM_SPEED_Y = 1.8f` (ajuste vertical suave en rango `[-150, 150]`).
+  - **Configuración de sensibilidad opcional:** lee `ux0:data/sacredodyssey/camera_sens.txt` (1..10, default 5).
+- **Validación:** build limpio con `psvita-toolkit build --preset release`. `sacredodyssey.vpk` y `eboot.bin` actualizados.
+
 
 

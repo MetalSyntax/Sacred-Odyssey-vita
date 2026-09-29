@@ -2,6 +2,8 @@
 #include "utils/logger.h"
 
 #include <so_util/so_util.h>
+#include <psp2/io/fcntl.h>
+#include <stdlib.h>
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
@@ -428,26 +430,73 @@ static void hook_HudMovePad_Get_MovePad_AxisValues(float *out, uintptr_t this_pt
     if (g_pad.buttons & SCE_CTRL_DOWN)  out[1] =  1.0f;
 }
 
-// Hook for CameraRotatePad::Get_MovePad_AxisValues (Right Analog Stick)
+// Right Analog Stick Camera Look (calibrated with NOVA 2 & Shadow Guardian)
 //
-// 2026-09-18: el stick derecho sumaba hasta 8.5 "px" por llamada mientras un
-// dedo real produce deltas acumulados de cientos de px -- se sentia lento e
-// impreciso al lado del tactil. Nuevo enfoque: dedo VIRTUAL. Cuando el stick
-// se deflecta se integra su velocidad en un drag (origen + posicion actual
-// persistentes entre llamadas) y se emite `cur - start`, EXACTAMENTE la misma
-// magnitud que el path tactil de arriba (`cur_x - start_x`). Asi el motor
-// aplica al stick sus propias curvas/sensibilidad de dedo sin que este port
-// tenga que adivinarlas: por construccion se mueve igual que un dedo, con
-// precision fina cerca del centro (norm pequeno -> fracciones de px, out es
-// float). Al centrar el stick se "levanta el dedo" (reset); el tactil real
-// sigue mandando por su propio path y no se toca memoria del engine (solo
-// out[]), asi que ambos pueden convivir sin corromper estado.
-static float s_vcam_cur_x = 0.0f, s_vcam_cur_y = 0.0f;
+// Root Cause of violent snap and freezing:
+// 1. In CameraManager::Update, when the widget is not touched (*(char*)(widget + 0x1a) == 0),
+//    the engine saves lastCamDir = currentCamDir and lastHeight = currentHeight.
+// 2. Previously, s_vcam_cur_x/y was only reset in the else branch of this hook, but this hook
+//    is ONLY called by the engine when *(char*)(widget + 0x1a) != 0! When the user centered
+//    the stick, this hook was never called, leaving s_vcam_cur_x frozen at +/-500.0f.
+//    The moment the user touched the stick again, out[0] was immediately +/-500.0f on frame 1,
+//    causing the engine (which divides out[0] by 270.0f and multiplies by PI) to rotate lastCamDir
+//    by 333° instantly -- creating a violent snap/jump!
+// 3. Clamping s_vcam_cur_x to [-500, 500] also prevented continuous 360° rotation.
+//
+// Fix:
+// - Camera accumulation and centering reset are moved to controls_update(), running unconditionally
+//   every frame. In repose, s_vcam_cur_x/y are immediately 0.0f.
+// - Quadratic deadzone curve (0.15f deadzone + 0.35*t + 0.65*t^2) matching Shadow Guardian / NOVA 2
+//   for ultra-smooth, analog camera control.
+// - Horizontal accumulation wraps at +/-1080.0f (exact 4*PI period of quaternion fromAngleAxis),
+//   enabling continuous 360° rotation forever with zero discontinuity.
+#define CAM_LOOK_DZ       0.15f
+#define CAM_SPEED_X       4.5f
+#define CAM_SPEED_Y       1.8f
+#define CAM_LEVEL_DEFAULT 5
+#define CAM_LEVEL_MAX     10
+#define CAM_CFG           DATA_PATH "camera_sens.txt"
+
+static int s_cam_level = CAM_LEVEL_DEFAULT;
+static float s_vcam_cur_x = 0.0f;
+static float s_vcam_cur_y = 0.0f;
+
+static void cam_load_config(void) {
+    SceUID fd = sceIoOpen(CAM_CFG, SCE_O_RDONLY, 0);
+    if (fd < 0) return;
+    char b[8] = { 0 };
+    sceIoRead(fd, b, sizeof(b) - 1);
+    sceIoClose(fd);
+    int v = atoi(b);
+    if (v >= 1 && v <= CAM_LEVEL_MAX) {
+        s_cam_level = v;
+        l_info("[cam] Loaded camera sensitivity %d/%d from %s", s_cam_level, CAM_LEVEL_MAX, CAM_CFG);
+    }
+}
+
+static inline float cam_look_curve(float v) {
+    float a = v < 0.0f ? -v : v;
+    if (a <= CAM_LOOK_DZ)
+        return 0.0f;
+    float t = (a - CAM_LOOK_DZ) / (1.0f - CAM_LOOK_DZ);
+    if (t > 1.0f)
+        t = 1.0f;
+    t = 0.35f * t + 0.65f * t * t;
+    return v < 0.0f ? -t : t;
+}
+
 static void hook_CameraRotatePad_Get_MovePad_AxisValues(float *out, uintptr_t this_ptr) {
     out[0] = 0.0f;
     out[1] = 0.0f;
 
-    // 1. Check touch camera rotation
+    // 1. Right analog stick (takes priority when deflected)
+    if (s_cam_stick_deflected) {
+        out[0] = s_vcam_cur_x;
+        out[1] = s_vcam_cur_y;
+        return;
+    }
+
+    // 2. Real touch camera rotation fallback (screen dragging)
     if (this_ptr && *(uint8_t *)(this_ptr + 25) != 0) { // 0x19
         uintptr_t touch_info = *(uintptr_t *)(this_ptr + 296); // 0x128
         if (touch_info) {
@@ -458,35 +507,6 @@ static void hook_CameraRotatePad_Get_MovePad_AxisValues(float *out, uintptr_t th
             out[0] = (float)cur_x - start_x;
             out[1] = (float)cur_y - start_y;
         }
-    }
-
-    // 2. Physical Right Analog Stick as a virtual finger drag
-    float rx = (g_pad.rx - 128) / 128.0f;
-    float ry = (g_pad.ry - 128) / 128.0f;
-    float r_len = sqrtf(rx * rx + ry * ry);
-    const float deadzone = 0.12f;
-
-    if (r_len > deadzone) {
-        float norm = (r_len - deadzone) / (1.0f - deadzone);
-        if (norm > 1.0f) norm = 1.0f;
-        // Px por llamada a deflection maxima: a 60 fps son ~720 px/s, un
-        // swipe rapido de dedo; cerca del centro, fracciones de px.
-        const float px_per_call = 12.0f;
-        s_vcam_cur_x += (rx / r_len) * norm * px_per_call;
-        s_vcam_cur_y += (ry / r_len) * norm * px_per_call;
-        // Clamp como los bordes de pantalla de un drag real: evita deriva
-        // infinita si se deja el stick pisado mucho rato.
-        if (s_vcam_cur_x >  500.0f) s_vcam_cur_x =  500.0f;
-        if (s_vcam_cur_x < -500.0f) s_vcam_cur_x = -500.0f;
-        if (s_vcam_cur_y >  500.0f) s_vcam_cur_y =  500.0f;
-        if (s_vcam_cur_y < -500.0f) s_vcam_cur_y = -500.0f;
-        out[0] += s_vcam_cur_x; // start virtual = (0,0): out = cur - start
-        out[1] += s_vcam_cur_y;
-    } else {
-        // Stick centrado = dedo levantado: el proximo deflect resetea el
-        // drag desde cero en vez de heredar un salto discontinuo.
-        s_vcam_cur_x = 0.0f;
-        s_vcam_cur_y = 0.0f;
     }
 }
 
@@ -523,6 +543,8 @@ void controls_init(so_touch_fn touch_fn, so_key_fn key_down_fn, so_key_fn key_up
     g_pad.ly = 128;
     g_pad.rx = 128;
     g_pad.ry = 128;
+
+    cam_load_config();
 
     // Hook Left Analog Stick / Movement Pad
     uintptr_t movepad_sym = so_symbol(&so_mod, "_ZN10HudMovePad22Get_MovePad_AxisValuesEv");
@@ -600,15 +622,34 @@ void controls_update(void) {
     uint32_t pressed = s_current_buttons & ~s_old_buttons;
     uint32_t released = ~s_current_buttons & s_old_buttons;
 
-    // Snapshot para hook_CameraRotatePad_UpdateTouchInfo (ver su comentario):
-    // controls_update() corre ANTES de nativeGameRendererRender() en el loop
-    // de main.c, asi que este valor ya esta listo para cuando ese hook (y
-    // despues CameraManager::Update) lo lean mas adelante en el mismo frame.
-    // Mismo deadzone que hook_CameraRotatePad_Get_MovePad_AxisValues.
+    // Right Analog Stick Camera Look (calibrated with NOVA 2 & Shadow Guardian):
+    // Controls camera rotation smoothly without snapping or freezing.
+    // When deflected, integrates angular velocity into virtual coordinates.
+    // When released, resets to 0 so the next movement begins smoothly from the current camera view.
     {
         float rx = (g_pad.rx - 128) / 128.0f;
         float ry = (g_pad.ry - 128) / 128.0f;
-        s_cam_stick_deflected = (rx * rx + ry * ry) > (0.12f * 0.12f);
+        float k = (float)s_cam_level / (float)CAM_LEVEL_DEFAULT;
+        float vx = cam_look_curve(rx) * CAM_SPEED_X * k;
+        float vy = cam_look_curve(ry) * CAM_SPEED_Y * k;
+
+        if (vx != 0.0f || vy != 0.0f) {
+            s_cam_stick_deflected = true;
+            s_vcam_cur_x += vx;
+            s_vcam_cur_y += vy;
+
+            // Continuous horizontal wrap at 4*PI (1080.0f units in Sacred Odyssey engine space)
+            while (s_vcam_cur_x > 1080.0f)  s_vcam_cur_x -= 1080.0f;
+            while (s_vcam_cur_x < -1080.0f) s_vcam_cur_x += 1080.0f;
+
+            // Vertical pitch/height clamp
+            if (s_vcam_cur_y > 150.0f)  s_vcam_cur_y = 150.0f;
+            if (s_vcam_cur_y < -150.0f) s_vcam_cur_y = -150.0f;
+        } else {
+            s_cam_stick_deflected = false;
+            s_vcam_cur_x = 0.0f;
+            s_vcam_cur_y = 0.0f;
+        }
     }
 
     // Volcado diagnostico de la tabla de widgets (una vez por instancia
