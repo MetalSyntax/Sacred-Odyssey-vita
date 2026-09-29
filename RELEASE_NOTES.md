@@ -12,6 +12,13 @@
   - **Quadratic analog deadzone curve:** implemented standard `0.15f` deadzone with quadratic response (`0.35f * t + 0.65f * t^2`) for precision aiming and smooth full-stick pans.
   - **Customizable sensitivity:** loads optional sensitivity setting from `ux0:data/sacredodyssey/camera_sens.txt` (1..10, default 5).
 
+### Testing & Verification
+- **Installation:** Install `build/sacredodyssey.vpk` via VitaShell, or upload `build/eboot.bin` directly to `ux0:app/SODY00001/eboot.bin`.
+- **Items to check:**
+  1. Starting a new game proceeds through the intro horse cutscene in World 10 without crashes.
+  2. The right analog stick controls the camera smoothly with analog precision; no sudden 333° jumping/snapping when releasing and repushing the stick.
+  3. Continuous horizontal camera rotation turns smoothly 360° indefinitely without stopping or getting stuck.
+
 ---
 
 ## v0.1.0 / v1.0.1 (Initial Release)

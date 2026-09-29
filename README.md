@@ -21,11 +21,11 @@ the Android/JNI/OpenGL ES layer underneath it.
   loads saves, and is fully playable from start to finish with a physical controller, although it is
   still in development and has one known open issue (erratic FPS, see below).
 - 🎮 **Full physical control mapping** (`source/controls.c`): left stick / D-Pad for 360° movement
-  (radial deadzone), right stick for camera rotation (works without touching the screen, via a
-  `CameraRotatePad::UpdateTouchInfo` gate hook), and every face button / trigger mapped to its HUD
-  widget — attack, shield, horse mount/dismount, minimap, pause and in-game menus. Touch screen keeps
-  working in parallel (5 shared slots). Pressing **L+R together** reveals the full virtual HUD at
-  full opacity.
+  (radial deadzone), right stick for smooth analog camera rotation calibrated against N.O.V.A. 2 and
+  Shadow Guardian (quadratic response curve, eliminated camera snapping/resets, infinite 360° continuous rotation,
+  works without touching the screen), and every face button / trigger mapped to its HUD widget — attack, shield,
+  horse mount/dismount, minimap, pause and in-game menus. Touch screen keeps working in parallel (5 shared slots).
+  Pressing **L+R together** reveals the full virtual HUD at full opacity.
 - 🖥️ **HUD reorganized for console play:** menu icon, character portrait/health, minimap and the
   weapon-switch icon stay at full opacity at all times; the rest of the touchscreen HUD is dimmed to
   the background (still touchable) instead of covering the screen.
@@ -99,6 +99,13 @@ the Android/JNI/OpenGL ES layer underneath it.
 Menu icon, character portrait/health, minimap and the weapon-switch icon are always shown at full
 opacity; the rest of the touchscreen HUD is dimmed to the background (still fully touchable — dimming
 only changes alpha, never the visible/active flags the touch hit-test needs; see `source/controls.c`).
+
+### Camera Sensitivity Configuration
+
+Right stick camera sensitivity is adjustable via an optional configuration file:
+- File path on Vita: `ux0:data/sacredodyssey/camera_sens.txt`
+- Values: integer from `1` to `10` (default is `5` = 100% standard speed).
+- Created/edited with VitaShell or any text editor.
 
 ## Building from source
 
